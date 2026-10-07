@@ -1265,7 +1265,6 @@ def _settle_gateway_terminal_error(
         if not isinstance(session.messages, list):
             session.messages = []
         session.messages.append(error_message)
-        session.workspace = str(workspace)
         session.model = persisted_model if persisted_model is not None else model
         session.model_provider = (
             persisted_model_provider
@@ -1425,6 +1424,10 @@ def _run_gateway_chat_streaming(
     usage = {"input_tokens": 0, "output_tokens": 0, "estimated_cost": 0}
     try:
         s = get_session(session_id)
+        # The route owns first binding. Reattach and compression can leave the
+        # worker's launch argument stale; Gateway requests use the session value.
+        workspace = str(s.workspace)
+        update_active_run(stream_id, workspace=workspace)
         from api.config import get_config  # imported lazily to avoid config-cycle churn
 
         cfg = get_config()
@@ -1839,7 +1842,6 @@ def _run_gateway_chat_streaming(
             s.pending_attachments = None
             s.pending_started_at = None
             s.pending_user_source = None
-            s.workspace = str(workspace)
             s.model = persisted_model if persisted_model is not None else model
             s.model_provider = (
                 persisted_model_provider

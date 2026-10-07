@@ -204,6 +204,8 @@ def test_session_new_recovers_deleted_workspace_inherited_from_visible_previous_
 ):
     fallback = tmp_path / "fallback"
     fallback.mkdir()
+    profile_default = tmp_path / "profile-default"
+    profile_default.mkdir()
     stale = tmp_path / "deleted-workspace"
     previous = SimpleNamespace(
         session_id="previous-session",
@@ -220,6 +222,7 @@ def test_session_new_recovers_deleted_workspace_inherited_from_visible_previous_
 
     monkeypatch.setattr(workspace, "_home_path", lambda: tmp_path)
     monkeypatch.setattr(workspace, "load_workspaces", lambda: [])
+    monkeypatch.setattr(workspace, "_profile_default_workspace", lambda profile=None: str(profile_default))
     captured = _post_new_session_with_workspace(
         monkeypatch,
         body,
@@ -229,9 +232,13 @@ def test_session_new_recovers_deleted_workspace_inherited_from_visible_previous_
 
     assert "error" not in captured
     assert captured["response"][0] == 200
-    assert captured["response"][1]["session"]["workspace"] == str(fallback.resolve())
-    assert captured["new"][0]["workspace"] == str(fallback.resolve())
-    assert captured["fallback"] == 1
+    # Operator decision #5 (fix-pass brief): inherited deleted folders recover
+    # to the configured profile default, which is unassigned, never last-used.
+    assert captured["response"][1]["session"]["workspace"] == str(profile_default.resolve())
+    assert captured["new"][0]["workspace"] == str(profile_default.resolve())
+    assert captured["new"][0]["project_id"] is None
+    assert captured["response"][1]["project_source"] is None
+    assert captured["fallback"] == 0
 
 
 @pytest.mark.parametrize(

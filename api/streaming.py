@@ -3171,6 +3171,19 @@ def _aiagent_import_error_detail() -> str:
 from api.models import get_session, title_from
 from api.workspace import _resolve_path
 
+
+def _turn_workspace_cwd_for_session(session, _requested_workspace):
+    """Use the session's bound workspace for a turn, including rotated agents.
+
+    The route owns first-turn binding. A worker's ``workspace`` argument is a
+    launch snapshot and can be stale by the time the worker runs. Resolving the
+    session value with its own profile preserves remote target-side paths.
+    """
+    bound_workspace = getattr(session, 'workspace', None)
+    if not bound_workspace:
+        raise ValueError('Session has no bound workspace')
+    return str(_resolve_path(bound_workspace, profile=getattr(session, 'profile', None)))
+
 # Fields that are safe to send to LLM provider APIs.
 # Everything else (attachments, timestamp, _ts, etc.) is display-only
 # metadata added by the webui and must be stripped before the API call.
@@ -11371,22 +11384,25 @@ def _run_agent_streaming(
         # captures THIS session, not a concurrent turn's process-global env).
         # Co-located with the existing env-restore lifecycle: set here, reset
         # in the outer finally next to _clear_thread_env().
-        # Resolved the same way as `s.workspace` below so the bound cwd and the
-        # session's own record cannot disagree. Guarded: a turn must not die
-        # here because a workspace path is malformed.
+        # The route bound the first-turn workspace before launching this worker.
+        # Its launch argument may be stale, especially after agent compression.
+        # Normalize the session-owned path for this turn without rebinding it.
         s = get_session(session_id)
         try:
-            _turn_workspace_cwd = str(_resolve_path(workspace, profile=getattr(s, 'profile', None)))
+            _turn_workspace_cwd = _turn_workspace_cwd_for_session(s, workspace)
         except Exception:
-            _turn_workspace_cwd = ""
+            if not getattr(s, 'workspace', None):
+                raise
+            _turn_workspace_cwd = str(s.workspace)
             logger.debug("per-turn workspace cwd resolve failed", exc_info=True)
+        workspace = _turn_workspace_cwd
+        update_active_run(stream_id, workspace=workspace)
         _turn_session_identity_tokens = _set_turn_session_identity(
             session_id, workspace=_turn_workspace_cwd
         )
         _turn_pending_source = getattr(s, 'pending_user_source', None) or 'webui'
         _active_turn_identity = _active_turn_authority(s, stream_id, msg_text)
         update_active_run(stream_id, phase="running", session_id=session_id)
-        s.workspace = _turn_workspace_cwd
         _last_persisted_model = None
         _last_persisted_provider = None
         _turn_owns_persisted_model = False
@@ -12831,20 +12847,15 @@ def _run_agent_streaming(
             # Prepend workspace context so the agent always knows which directory
             # to use for file operations, regardless of session age or AGENTS.md defaults.
             workspace_ctx = _workspace_context_prefix(str(s.workspace))
-            # #6672: interpolate the session-CREATION workspace (immutable), never
-            # the live s.workspace, into the system prompt. s.workspace changes on
-            # every mid-session workspace switch in the WebUI header; mutating the
-            # system prompt would rewrite msg[0] and invalidate the LLM prefix
-            # cache (APC/Radix Tree) for the whole 50k+ token transcript. Active
-            # switches still reach the model via the [Workspace::v1: ...] tag on
-            # the current user turn (workspace_ctx above), which lives in msg[-1].
+            # #6672: retain the session-creation workspace in the system prompt.
+            # Legacy sessions may have an older created_workspace snapshot; the
+            # current immutable binding still governs this turn's cwd and tag.
             _session_workspace_frozen = getattr(s, 'created_workspace', None) or str(s.workspace)
             workspace_system_msg = (
                 f"Active workspace at session start: {_session_workspace_frozen}\n"
                 "Every user message is prefixed with [Workspace::v1: /absolute/path] indicating the "
-                "workspace the user has selected in the web UI at the time they sent that message. "
-                "This tag is the single authoritative source of the active workspace and updates "
-                "with every message. It overrides any prior workspace mentioned in this system "
+                "workspace bound to this session. "
+                "This tag is the authoritative workspace for this turn. It overrides any prior workspace mentioned in this system "
                 "prompt, memory, or conversation history. Always use the value from the most recent "
                 "[Workspace::v1: ...] tag as your default working directory for ALL file operations: "
                 "write_file, read_file, search_files, terminal workdir, and patch. "
@@ -12878,9 +12889,7 @@ def _run_agent_streaming(
                     'source': 'webui',
                     'session_id': session_id,
                     'profile': getattr(s, 'profile', None),
-                    # #6672: frozen session-creation workspace — see
-                    # workspace_system_msg above. Live workspace switches stay out
-                    # of msg[0] so LLM prefix caches are not invalidated.
+                    # #6672: session-creation snapshot — see workspace_system_msg.
                     'workspace': _session_workspace_frozen,
                 },
                 config_data=_cfg,

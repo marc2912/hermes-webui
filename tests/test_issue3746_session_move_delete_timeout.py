@@ -19,6 +19,7 @@ import threading
 from pathlib import Path
 
 ROUTES_SRC = (Path(__file__).parent.parent / "api" / "routes.py").read_text(encoding="utf-8")
+MODELS_SRC = (Path(__file__).parent.parent / "api" / "models.py").read_text(encoding="utf-8")
 
 
 # ── A) Behavioral: the bounded lock acquire actually returns instead of blocking ──
@@ -87,6 +88,15 @@ def test_move_releases_lock_in_finally():
 # ── B) Structural: project delete skips streaming sessions + guards each save ──
 
 def _delete_block():
+    # operator decision (MCP delete fix): logic moved to shared helper.
+    idx = ROUTES_SRC.find('def _clear_deleted_project_sessions_http(')
+    assert idx > 0, "projects/delete session-clearing strategy not found"
+    end = ROUTES_SRC.find('def _workspace_project_for_path(', idx)
+    assert end > idx
+    return ROUTES_SRC[idx:end]
+
+
+def _delete_route_block():
     idx = ROUTES_SRC.find('"/api/projects/delete"')
     assert idx > 0, "projects/delete handler not found"
     end = ROUTES_SRC.find('"/api/session/import"', idx)
@@ -95,6 +105,8 @@ def _delete_block():
 
 def test_delete_clears_project_id_on_streaming_sessions_in_cache():
     block = _delete_block()
+    # operator decision (MCP delete fix): logic moved to shared helper.
+    assert 'clear_sessions=_clear_deleted_project_sessions_http' in _delete_route_block()
     assert "_active_stream_ids()" in block, (
         "projects/delete must compute the active stream set to special-case streaming sessions (#3746)"
     )
@@ -115,13 +127,19 @@ def test_delete_clears_project_id_on_streaming_sessions_in_cache():
 
 def test_delete_guards_each_session_save():
     block = _delete_block()
+    # operator decision (MCP delete fix): logic moved to shared helper.
+    assert 'clear_sessions=_clear_deleted_project_sessions_http' in _delete_route_block()
     # Each per-session update stays wrapped in try/except so one slow/failing
     # session can't abort the whole delete.
     assert "try:" in block and "except Exception:" in block, (
         "projects/delete must guard each per-session update (#3746)"
     )
     # The active-profile ownership guard (#1614) must remain intact.
-    assert '_profiles_match(proj.get("profile"), active_profile)' in block, (
+    # operator decision (MCP delete fix): logic moved to shared helper.
+    storage_block = MODELS_SRC.split('def delete_project_record(', 1)[1].split('CRON_PROJECT_NAME =', 1)[0]
+    assert 'delete_project_record(' in _delete_route_block() and 'get_active_profile_name()' in _delete_route_block()
+    # operator decision (MCP delete fix): logic moved to shared helper.
+    assert "_profiles_match(deleted.get('profile'), profile)" in storage_block, (
         "projects/delete must keep its cross-profile ownership guard (#1614)"
     )
 

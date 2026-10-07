@@ -6204,6 +6204,7 @@ function _renderWorkspaceDetail(ws){
         <div class="detail-row"><div class="detail-row-label">Name</div><div class="detail-row-value">${esc(ws.name || '')}</div></div>
         <div class="detail-row"><div class="detail-row-label">Path</div><div class="detail-row-value"><code>${esc(ws.path)}</code></div></div>
         <div class="detail-row"><div class="detail-row-label">Status</div><div class="detail-row-value">${statusBadge}${defaultBadge}</div></div>
+        ${!isDefault&&!ws.project_id?`<div class="detail-row"><div class="detail-row-label">Project</div><div class="detail-row-value">Unlinked workspace <button type="button" onclick="linkCurrentWorkspaceProject()">Create project</button></div></div>`:''}
       </div>
       <div class="detail-card" style="margin-top:12px">
         <div class="detail-card-title">${esc(t('checkpoint_title'))}</div>
@@ -6217,6 +6218,24 @@ function _renderWorkspaceDetail(ws){
   _workspaceMode = 'read';
   _setWorkspaceHeaderButtons('read', ws);
   _loadCheckpoints(ws.path);
+}
+
+async function linkCurrentWorkspaceProject(){
+  const ws=_currentWorkspaceDetail;
+  if(!ws||!ws.workspace_id||ws.project_id)return;
+  const name=await showPromptDialog({title:'Create project',message:'Name for this workspace project',defaultValue:ws.name||''});
+  if(!name||!name.trim())return;
+  try{
+    const result=await api('/api/workspaces/link-project',{method:'POST',body:JSON.stringify({workspace_id:ws.workspace_id,project_name:name.trim()})});
+    if(result.workspace){
+      const idx=_workspaceList.findIndex(w=>w.workspace_id===ws.workspace_id);
+      if(idx>=0)_workspaceList[idx]=result.workspace;
+      if(result.project&&Array.isArray(_allProjects))_allProjects.push(result.project);
+      renderWorkspacesPanel(_workspaceList);
+      _renderWorkspaceDetail(result.workspace);
+      if(typeof renderSessionListFromCache==='function')renderSessionListFromCache();
+    }
+  }catch(e){showToast(t('error_prefix')+e.message);}
 }
 
 function _setWorkspaceHeaderButtons(mode, ws){
@@ -6279,7 +6298,9 @@ async function activateCurrentWorkspace(){
 async function deleteCurrentWorkspace(){
   if (!_currentWorkspaceDetail) return;
   const path = _currentWorkspaceDetail.path;
-  const _ok = await showConfirmDialog({title:t('workspace_remove_confirm_title'),message:t('workspace_remove_confirm_message',path),confirmLabel:t('remove'),danger:true,focusCancel:true});
+  const linked=(_allProjects||[]).find(p=>p.project_id===_currentWorkspaceDetail.project_id);
+  const message=t('workspace_remove_confirm_message',path)+(linked?' The project "'+linked.name+'" and its conversations are kept.':'');
+  const _ok = await showConfirmDialog({title:t('workspace_remove_confirm_title'),message,confirmLabel:t('remove'),danger:true,focusCancel:true});
   if(!_ok) return;
   try{
     const data=await api('/api/workspaces/remove',{method:'POST',body:JSON.stringify({path})});
@@ -6333,6 +6354,16 @@ function _renderWorkspaceForm({ name, path, isEdit }){
           </div>
           ${pathHint}
         </div>
+        ${isEdit?(_currentWorkspaceDetail&&_currentWorkspaceDetail.project_id?`<label class="detail-form-check"><input type="checkbox" id="workspaceFormRenameProject"> Also rename linked project</label>`:''):`
+        <label class="detail-form-check"><input type="checkbox" id="workspaceFormLinkProject" checked> Create a project for this workspace</label>
+        <div class="detail-form-row" id="workspaceFormProjectFields">
+          <label for="workspaceFormProjectName">Project name</label>
+          <input type="text" id="workspaceFormProjectName" value="${esc(name||'')}" autocomplete="off">
+          <label for="workspaceFormProjectColor">Project color (optional)</label>
+          <input type="color" id="workspaceFormProjectColor" value="#7aa2ff">
+          <label class="detail-form-check"><input type="checkbox" id="workspaceFormUseColor"> Use this color</label>
+          <div id="workspaceFormDuplicateWarning" class="detail-form-hint" role="status"></div>
+        </div>`}
         <div id="workspaceFormError" class="detail-form-error" style="display:none"></div>
       </form>
     </div>`;
@@ -6340,6 +6371,17 @@ function _renderWorkspaceForm({ name, path, isEdit }){
   if (empty) empty.style.display = 'none';
   _setWorkspaceHeaderButtons(isEdit ? 'edit' : 'create');
   if (!isEdit) _wireWorkspaceFormPathSuggestions();
+  if(!isEdit){
+    const nameInput=$('workspaceFormName'),projectInput=$('workspaceFormProjectName'),pathInput=$('workspaceFormPath');
+    const linkInput=$('workspaceFormLinkProject'),fields=$('workspaceFormProjectFields'),warning=$('workspaceFormDuplicateWarning');
+    let projectEdited=false,nameEdited=false;
+    const warn=()=>{if(warning)warning.textContent=linkInput.checked&&projectInput.value.trim()&&(_allProjects||[]).some(p=>p.parent_id==null&&p.name.toLowerCase()===projectInput.value.trim().toLowerCase())?'A project with this name already exists.':'';};
+    nameInput.addEventListener('input',()=>{nameEdited=!!nameInput.value.trim();if(!projectEdited)projectInput.value=nameInput.value;warn();});
+    projectInput.addEventListener('input',()=>{projectEdited=true;warn();});
+    pathInput.addEventListener('input',()=>{if(!nameEdited){const base=pathInput.value.replace(/\/+$/,'').split('/').pop()||'';nameInput.value=base;if(!projectEdited)projectInput.value=base;}warn();});
+    linkInput.addEventListener('change',()=>{fields.hidden=!linkInput.checked;warn();});
+    warn();
+  }
   const focus = isEdit ? $('workspaceFormName') : $('workspaceFormPath');
   if (focus) focus.focus();
 }
@@ -6369,6 +6411,9 @@ async function saveWorkspaceForm(){
       const targetPath = _currentWorkspaceDetail.path;
       const newName = name || _currentWorkspaceDetail.name || '';
       await api('/api/workspaces/rename', { method:'POST', body: JSON.stringify({ path: targetPath, name: newName }) });
+      if($('workspaceFormRenameProject')?.checked&&_currentWorkspaceDetail.project_id){
+        await api('/api/projects/rename',{method:'POST',body:JSON.stringify({project_id:_currentWorkspaceDetail.project_id,name:newName})});
+      }
       // Refresh list and re-render detail
       const data = await api('/api/workspaces');
       _workspaceList = data.workspaces || [];
@@ -6378,16 +6423,21 @@ async function saveWorkspaceForm(){
       openWorkspaceDetail(targetPath);
       return;
     }
-    const data = await api('/api/workspaces/add', { method:'POST', body: JSON.stringify({ path }) });
+    const linkProject=!!$('workspaceFormLinkProject')?.checked;
+    const projectName=($('workspaceFormProjectName')?.value||name||path.split('/').pop()).trim();
+    const projectColor=$('workspaceFormUseColor')?.checked?$('workspaceFormProjectColor')?.value:null;
+    const data = await api('/api/workspaces/add', { method:'POST', body: JSON.stringify({ path,name,project_name:projectName,link_project:linkProject,color:projectColor }) });
     _workspaceList = data.workspaces || [];
     _workspacePreFormDetail = null;
-    // Apply rename if a friendly name was supplied
-    if (name) {
-      try { await api('/api/workspaces/rename', { method:'POST', body: JSON.stringify({ path, name }) }); } catch(_) {}
-      const refreshed = await api('/api/workspaces');
-      _workspaceList = refreshed.workspaces || _workspaceList;
+    if(data.project&&Array.isArray(_allProjects))_allProjects.push(data.project);
+    const created=data.workspace||_workspaceList.find(w=>w.path===path);
+    if(name&&created&&created.name!==name){
+      await api('/api/workspaces/rename',{method:'POST',body:JSON.stringify({path:created.path,name})});
+      const refreshed=await api('/api/workspaces');
+      _workspaceList=refreshed.workspaces||_workspaceList;
     }
     renderWorkspacesPanel(_workspaceList);
+    if(typeof renderSessionListFromCache==='function')renderSessionListFromCache();
     showToast(t('workspace_added'));
     const added = _workspaceList.find(w => w.path === path) || _workspaceList[_workspaceList.length - 1];
     if (added) openWorkspaceDetail(added.path);
@@ -6515,17 +6565,11 @@ async function switchToWorkspace(path,name){
     showToast(t('workspace_busy_switch'));
     return;
   }
-  // #5473 (opt-in, default off): treat switching to a DIFFERENT workspace as a
-  // new-chat boundary instead of mutating the current session in place. A
-  // workspace switch changes the project-context files the agent loaded, so
-  // reusing the session would carry stale cross-workspace context. Only fires
-  // when: the setting is on, the target workspace actually differs from the
-  // current one, and the current conversation has real messages worth keeping on
-  // its original workspace. Same-workspace selection stays an in-place refresh.
+  // The first message fixes the session workspace. Later switches create a new
+  // chat; an empty session can still change workspace in place.
   if(
-    window._newChatOnWorkspaceSwitch===true &&
     S.session && S.session.workspace && path && path!==S.session.workspace &&
-    Array.isArray(S.messages) && S.messages.length>0
+    Array.isArray(S.messages) && (S.messages.length>0||Number(S.session.message_count)>0)
   ){
     if(typeof _previewDirty!=='undefined'&&_previewDirty){
       const discard=await showConfirmDialog({
@@ -6541,8 +6585,10 @@ async function switchToWorkspace(path,name){
     closeWsDropdown();
     // Bind the new chat to the selected workspace via the one-shot flag newSession() reads.
     S._profileSwitchWorkspace=path;
-    if(typeof newSession==='function') await newSession(false);
-    showToast(t('workspace_switched_new_chat',name||getWorkspaceFriendlyName(path)));
+    try{
+      if(typeof newSession==='function') await newSession(false);
+      showToast(t('workspace_switched_new_chat',name||getWorkspaceFriendlyName(path)));
+    }catch(e){setStatus(t('switch_failed')+e.message);}
     return;
   }
   if(typeof _previewDirty!=='undefined'&&_previewDirty){
@@ -6566,10 +6612,14 @@ async function switchToWorkspace(path,name){
     // mutation. Otherwise a delayed recovery response for this same session can
     // overwrite the user's newer selection and reject this switch's fresh tree.
     if(typeof bumpWorkspaceTreeGen==='function')bumpWorkspaceTreeGen();
-    await api('/api/session/update',{method:'POST',body:JSON.stringify({
+    const updated=await api('/api/session/update',{method:'POST',body:JSON.stringify({
       session_id:S.session.session_id, workspace:path, model:S.session.model, model_provider:S.session.model_provider||null
     })});
     S.session.workspace=path;
+    if(updated&&updated.session){
+      S.session.project_id=updated.session.project_id;
+      S.session.project_source=updated.session.project_source;
+    }
     // Explicit workspace switch = user overriding any pending profile-switch default.
     // Clear the one-shot flag so a subsequent newSession() inherits this choice instead.
     S._profileSwitchWorkspace=null;
@@ -8891,8 +8941,6 @@ function _preferencesPayloadFromUi(){
   if(defaultMessageModeSel) payload.default_message_mode=defaultMessageModeSel.value;
   const showBusyPlaceholderHintCb=$('settingsShowBusyPlaceholderHint');
   if(showBusyPlaceholderHintCb) payload.show_busy_placeholder_hint=showBusyPlaceholderHintCb.checked;
-  const newChatOnWorkspaceSwitchCb=$('settingsNewChatOnWorkspaceSwitch');
-  if(newChatOnWorkspaceSwitchCb) payload.new_chat_on_workspace_switch=newChatOnWorkspaceSwitchCb.checked;
   const botNameField=$('settingsBotName');
   if(botNameField) payload.bot_name=botNameField.value;
   Object.assign(payload,_speechPreferencesPayloadFromUi());
@@ -9038,9 +9086,6 @@ async function _autosavePreferencesSettings(payload){
     if(payload&&payload.show_busy_placeholder_hint!==undefined){
       window._showBusyPlaceholderHint=!!(saved&&saved.show_busy_placeholder_hint);
       if(typeof _applyBusyComposerPlaceholder==='function') _applyBusyComposerPlaceholder();
-    }
-    if(payload&&payload.new_chat_on_workspace_switch!==undefined){
-      window._newChatOnWorkspaceSwitch=!!(saved&&saved.new_chat_on_workspace_switch);  // #5473
     }
     _settingsPreferencesAutosaveRetryPayload=null;
     _setPreferencesAutosaveStatus('saved');
@@ -9826,12 +9871,6 @@ async function loadSettingsPanel(){
       showBusyPlaceholderHintCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});
     }
     if(typeof _applyBusyComposerPlaceholder==='function') _applyBusyComposerPlaceholder();
-    const newChatOnWorkspaceSwitchCb=$('settingsNewChatOnWorkspaceSwitch');
-    if(newChatOnWorkspaceSwitchCb){
-      newChatOnWorkspaceSwitchCb.checked=!!settings.new_chat_on_workspace_switch;
-      window._newChatOnWorkspaceSwitch=newChatOnWorkspaceSwitchCb.checked;
-      newChatOnWorkspaceSwitchCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});
-    }
     // Bot name — debounced autosave (text input)
     const botNameField=$('settingsBotName');
     if(botNameField){

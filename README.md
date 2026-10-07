@@ -223,6 +223,7 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 - Pinned-conversation limits apply separately to each session's owning profile; root/default aliases share a limit. Unpin an empty session before switching its profile through chat or `/goal`.
 - Archive sessions (hide without deleting, toggle to show)
 - Session projects -- named groups with colors for organizing sessions; delegated subagent sessions have no project of their own and follow their nearest ancestor's project in the project filter and the Unassigned chip; forks and other child sessions keep their own project, so a fork moved to "No project" stays Unassigned
+- A new chat inherits the previous session's workspace, or the active profile's default workspace when there is no previous session. It opens without a workspace picker; the workspace can still be changed before the first message.
 - Session tags -- add #tag to titles for colored chips and click-to-filter
 - Grouped by Today / Yesterday / Earlier in the sidebar (collapsible date groups)
 - Download as Markdown transcript, full JSON export, or import from JSON
@@ -231,6 +232,62 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 - Browser tab title reflects the active session name
 - CLI session bridge -- CLI sessions from hermes-agent's SQLite store appear in the sidebar with a gold "cli" badge; click to import with full history and reply normally
 - Token/cost display -- input tokens, output tokens, estimated cost shown per conversation (toggle in Settings or `/usage` command)
+
+### Workspaces and projects
+
+Workspaces hold paths; projects group conversations. Adding a workspace creates
+and links a project by default. In the add form, you can give the project a
+different name or turn off **Create a project for this workspace** for a scratch
+workspace. The configured default **Home** workspace is unlinked and marked as
+the default in workspace-list responses; the marker follows the current
+configuration. Without an explicit project choice, a new session derives its
+project only from an exact linked workspace path. A selected project filter
+does not assign new chats to that project.
+
+The project chip's **+** starts a chat in a linked project's workspace. For an
+unlinked project, it prompts for a saved workspace path and assigns the project
+explicitly. Moving a session to a project also assigns it explicitly and does
+not change its workspace. An empty session can change workspace and recalculate
+its derived project; an explicit assignment stays put. After the first message,
+the session's workspace is fixed. Choosing a different workspace then starts a
+new chat, while choosing the current workspace refreshes its file view. There
+is no setting to switch a populated conversation's workspace in place; an old
+saved value for that setting is ignored.
+
+Existing workspaces acquire stable `workspace_id` values and nullable
+`project_id` links, while old projects acquire a null `parent_id`; they are not
+linked automatically, and existing sessions are not reassigned. Workspace ID
+migration writes new IDs before returning them; a failed save returns an error.
+Migration keeps missing-path workspaces, remote paths, worktree data, and other
+workspace fields. The **Create project** action on an unlinked workspace creates
+and links a project; the API can also link an existing unlinked project.
+Only one workspace can own a given project, and links stay within one profile.
+For API callers, `POST /api/workspaces/link-project` accepts `workspace_id`
+and either `project_name` or `project_id`. An already linked workspace or
+project returns 409, the default workspace returns 400 with `not_linkable`,
+and a missing or foreign project returns 404. A session with an existing
+project tag and no `project_source` keeps that tag as an explicit assignment.
+New sessions persist `project_source` as
+`explicit`, `derived`, or null, and the new-session response echoes that value.
+The session schema also accepts `worktree` provenance; worktree creation
+does not currently stamp it or create worktree subprojects. A request without a workspace
+uses the profile default, not the last visited workspace.
+If a new chat inherits a deleted folder, it recovers to that profile default.
+An existing empty session may recover a deleted workspace and records the old
+path in `workspace_recovered_from` without changing its project assignment.
+A chat request on a session with messages reports `workspace_missing` and
+"Session workspace folder no longer exists" when its bound local folder was
+deleted. A user-requested switch to another live folder reports
+`workspace_immutable`. Remote terminal paths are never declared deleted from
+a host-local filesystem check.
+
+Renaming a workspace changes its display name, not its path or project name;
+the dialog can separately rename its linked project. Removing a workspace
+keeps its project and conversations. Deleting a project clears its workspace
+link and session project tags and source, while retaining conversation history;
+its child projects move up to the deleted project's parent. Remote workspace
+paths remain target-side paths for their profile, including paths that do not
+exist on the WebUI host; they are not resolved through the host filesystem.
 
 ### Workspace file browser
 - Directory tree with expand/collapse (single-click toggles, double-click navigates)
@@ -371,7 +428,7 @@ before the session's named-profile Gateway ownership is known.
 - **Memory** -- view and edit MEMORY.md and USER.md inline
 - **Profiles** -- create, switch, delete agent profiles; clone config
 - **Todos** -- live task list from the current session
-- **Spaces** -- add, rename, remove workspaces; quick-switch from topbar
+- **Spaces** -- add, rename, remove workspaces; switch from the composer workspace chip
 
 ### Mobile responsive
 - Hamburger sidebar -- slide-in overlay on mobile (<640px)

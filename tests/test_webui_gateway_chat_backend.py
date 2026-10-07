@@ -1438,7 +1438,8 @@ def test_gateway_chat_worker_forwards_image_attachments_as_multimodal_parts(tmp_
     monkeypatch.setattr(streaming, "_prefill_messages_with_webui_context", lambda ctx, cfg: [{"role": "user", "content": "webui session context"}])
     monkeypatch.setattr(gateway_chat.urllib.request, "urlopen", fake_urlopen)
 
-    s = new_session()
+    # 2026-10-07T033205173150Z-pr-1-workspace-as-master-immutable-session-workspace-reviewed-im-755eb4.md line 16: the image worker uses its session's bound workspace.
+    s = new_session(workspace=str(tmp_path))
     stream_id = "stream-gateway-image-test"
     s.active_stream_id = stream_id
     s.save()

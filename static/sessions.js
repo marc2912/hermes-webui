@@ -2012,14 +2012,14 @@ async function newSession(flash, options={}){
     const switchWs=S._profileSwitchWorkspace;
     S._profileSwitchWorkspace=null;
     const sessionWs=(!switchWs&&S.session)?S.session.workspace:null;
-    const inheritWs=switchWs||sessionWs||(S._profileDefaultWorkspace||null);
+    const inheritWs=(options&&options.workspace)||switchWs||sessionWs||(S._profileDefaultWorkspace||null);
     const reqBody={
       workspace:inheritWs,
       profile:S.activeProfile||'default',
     };
     if(S.session&&S.session.session_id){
       reqBody.prev_session_id=S.session.session_id;
-      if(sessionWs) reqBody.workspace_inherited_from_prev_session=true;
+      if(sessionWs&&inheritWs===sessionWs&&!switchWs&&!(options&&options.workspace)) reqBody.workspace_inherited_from_prev_session=true;
     }
     // Three-value worktree contract (#6022): explicit true/false is forwarded
     // verbatim; an ABSENT key lets the server apply the agent's config-level
@@ -2028,8 +2028,6 @@ async function newSession(flash, options={}){
     if(options&&Object.prototype.hasOwnProperty.call(options,'worktree')) reqBody.worktree=!!options.worktree;
     if(Object.prototype.hasOwnProperty.call(options,'project_id')){
       reqBody.project_id=options.project_id;
-    } else if(_activeProject&&_activeProject!==NO_PROJECT_FILTER){
-      reqBody.project_id=_activeProject;
     }
     // Forward a pre-session toolset override only from the empty composer (#4490).
     if(!S.session && Array.isArray(S._pendingSessionToolsets)) reqBody.enabled_toolsets=S._pendingSessionToolsets;
@@ -8439,6 +8437,12 @@ function _attachProjectQuickCreateButton(chip, project){
   btn.textContent='+';
   btn.title='New conversation in this project';
   btn.setAttribute('aria-label','New conversation in this project');
+  const linkedWorkspace=(typeof _workspaceList!=='undefined'&&Array.isArray(_workspaceList))
+    ? _workspaceList.find(w=>w.project_id===project.project_id):null;
+  if(linkedWorkspace&&linkedWorkspace.worktree&&linkedWorkspace.worktree.done){
+    btn.disabled=true;
+    btn.title='Worktree removed; open a conversation under its parent';
+  }
   const stop=function(e){
     if(!e) return;
     if(typeof e.preventDefault==='function') e.preventDefault();
@@ -8452,10 +8456,45 @@ function _attachProjectQuickCreateButton(chip, project){
   };
   btn.onclick=async(e)=>{
     stop(e);
+    if(btn.disabled)return;
+    const workspaceData=(typeof loadWorkspaceList==='function')?await loadWorkspaceList():{workspaces:[]};
+    const choices=Array.isArray(workspaceData&&workspaceData.workspaces)?workspaceData.workspaces:[];
+    const currentLink=choices.find(w=>w.project_id===project.project_id);
+    if(currentLink&&currentLink.worktree&&currentLink.worktree.done)return;
+    let workspace=currentLink&&currentLink.path;
+    if(!workspace){
+      // Unlinked projects still support explicit filing, after the user chooses
+      // the working directory for the new conversation.
+      const input=document.getElementById&&document.getElementById('appDialogInput');
+      const list=input&&document.body&&document.createElement('datalist');
+      if(list){
+        list.id='projectWorkspaceChoices';
+        for(const ws of choices){
+          const option=document.createElement('option');
+          option.value=ws.path;
+          option.label=ws.name||ws.path;
+          list.appendChild(option);
+        }
+        document.body.appendChild(list);
+        input.setAttribute('list',list.id);
+      }
+      let chosen;
+      try{
+        chosen=await showPromptDialog({title:'Choose workspace',message:'Choose a saved workspace for this project',
+          defaultValue:(S.session&&S.session.workspace)||S._profileDefaultWorkspace||''});
+      }finally{
+        if(input&&list){input.removeAttribute('list');list.remove();}
+      }
+      if(!chosen)return;
+      const target=choices.find(w=>w.path===chosen);
+      if(!target){if(typeof showToast==='function')showToast('Choose a saved workspace');return;}
+      workspace=target.path;
+    }
+    const createOptions={project_id:project.project_id,workspace};
     if(_newSessionInFlight){
       // The initiating tap already owns the filter change and rollback path.
       try{
-        await newSession(false,{project_id:project.project_id});
+        await newSession(false,createOptions);
       }catch(_){
         // The initiating tap already owns the visible failure path.
       }
@@ -8464,7 +8503,7 @@ function _attachProjectQuickCreateButton(chip, project){
     const previousProject=(typeof _activeProject!=='undefined')?_activeProject:NO_PROJECT_FILTER;
     _setActiveProjectFilter(project.project_id);
     try{
-      await newSession(false,{project_id:project.project_id});
+      await newSession(false,createOptions);
       // newSession() does not repaint the sidebar (callers own that — see the
       // newSession contract). Repaint from the post-create state so the new
       // project-assigned session appears deterministically.

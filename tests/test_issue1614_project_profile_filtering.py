@@ -202,7 +202,8 @@ def test_load_projects_idempotent_after_first_migrate(tmp_path, monkeypatch):
     projects_file = tmp_path / 'projects.json'
     projects_file.write_text(json.dumps([
         {'project_id': 'abc111', 'name': 'My Project',
-         'profile': 'haku', 'created_at': 1.0},
+         # 2026-10-07T033205173150Z-pr-1-workspace-as-master-immutable-session-workspace-reviewed-im-755eb4.md line 18: parent_id is part of the project schema.
+         'profile': 'haku', 'parent_id': None, 'created_at': 1.0},
     ]))
     monkeypatch.setattr(cfg, 'PROJECTS_FILE', projects_file)
     monkeypatch.setattr(models, 'PROJECTS_FILE', projects_file)
@@ -220,16 +221,11 @@ def test_load_projects_idempotent_after_first_migrate(tmp_path, monkeypatch):
 
 
 def test_profile_field_on_project_dict_default_create(monkeypatch):
-    """A new project dict shape must include `profile` after create.
-
-    We can't full-stack-test the HTTP path without spinning up a server, so
-    instead we pin the file-level invariant: the create handler now stamps
-    `profile` on the created dict.
-    """
+    """The route passes a validated profile and storage stamps it on the project."""
     from pathlib import Path
     src = (Path(__file__).parent.parent / 'api' / 'routes.py').read_text(encoding='utf-8')
 
-    # The create handler must now include get_active_profile_name() for the new dict
+    # The create handler must pass the selected profile to the storage helper.
     create_idx = src.find('"/api/projects/create"')
     assert create_idx > 0
     next_handler_idx = src.find('"/api/projects/rename"', create_idx)
@@ -237,9 +233,16 @@ def test_profile_field_on_project_dict_default_create(monkeypatch):
     # The create handler must stamp the profile from a (validated) body value or
     # the active profile. #3331 follow-up: the raw body value is now validated
     # via _PROFILE_ID_RE before stamping, so the expression reads `_requested_profile`.
-    assert '"profile": _requested_profile or get_active_profile_name() or \'default\'' in create_block, (
+    # operator decision (MCP delete fix): logic moved to shared helper.
+    assert "create_project_record(" in create_block
+    # operator decision (MCP delete fix): logic moved to shared helper.
+    assert "_requested_profile or get_active_profile_name() or 'default'" in create_block, (
         "Project create must stamp the active profile or accept a validated profile from body (#1614/#3331)"
     )
+    models_src = (Path(__file__).parent.parent / 'api' / 'models.py').read_text(encoding='utf-8')
+    create_helper = models_src.split('def create_project_record(', 1)[1].split('def rename_project_record(', 1)[0]
+    # operator decision (MCP delete fix): logic moved to shared helper.
+    assert "'profile': profile" in create_helper
     # And the validation guard must be present (reject unknown/invalid profile ids).
     assert '_PROFILE_ID_RE.fullmatch(_requested_profile)' in create_block, (
         "Project create must validate a client-supplied profile before stamping it (#3331)"
@@ -247,7 +250,7 @@ def test_profile_field_on_project_dict_default_create(monkeypatch):
 
 
 def test_project_rename_rejects_cross_profile():
-    """Source-string check that rename's active-profile guard is in place."""
+    """The route supplies the active profile to the storage ownership guard."""
     from pathlib import Path
     src = (Path(__file__).parent.parent / 'api' / 'routes.py').read_text(encoding='utf-8')
 
@@ -255,7 +258,12 @@ def test_project_rename_rejects_cross_profile():
     assert rename_idx > 0
     next_idx = src.find('"/api/projects/delete"', rename_idx)
     rename_block = src[rename_idx:next_idx]
-    assert '_profiles_match(proj.get("profile"), active_profile)' in rename_block, (
+    # operator decision (MCP delete fix): logic moved to shared helper.
+    assert 'rename_project_record(' in rename_block and 'get_active_profile_name()' in rename_block
+    models_src = (Path(__file__).parent.parent / 'api' / 'models.py').read_text(encoding='utf-8')
+    rename_helper = models_src.split('def rename_project_record(', 1)[1].split('def delete_project_record(', 1)[0]
+    # operator decision (MCP delete fix): logic moved to shared helper.
+    assert "_profiles_match(project.get('profile'), profile)" in rename_helper, (
         "Rename must check active-profile ownership"
     )
 
@@ -267,7 +275,12 @@ def test_project_delete_rejects_cross_profile():
     delete_idx = src.find('"/api/projects/delete"')
     assert delete_idx > 0
     delete_block = src[delete_idx:delete_idx + 1500]
-    assert '_profiles_match(proj.get("profile"), active_profile)' in delete_block, (
+    # operator decision (MCP delete fix): logic moved to shared helper.
+    assert 'delete_project_record(' in delete_block and 'get_active_profile_name()' in delete_block
+    models_src = (Path(__file__).parent.parent / 'api' / 'models.py').read_text(encoding='utf-8')
+    delete_helper = models_src.split('def delete_project_record(', 1)[1].split('CRON_PROJECT_NAME =', 1)[0]
+    # Operator decision (MCP delete fix): logic moved to shared helper.
+    assert "_profiles_match(deleted.get('profile'), profile)" in delete_helper, (
         "Delete must check active-profile ownership"
     )
 
