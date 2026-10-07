@@ -36,10 +36,12 @@ def _extract_function(source: str, name: str) -> str:
     raise AssertionError(f"{name} function body not closed")
 
 
-def test_new_session_uses_explicit_project_override_before_active_filter():
+def test_new_session_uses_explicit_project_override_without_active_filter():
     src = _read(SESSIONS_JS)
     assert "Object.prototype.hasOwnProperty.call(options,'project_id')" in src
     assert "reqBody.project_id=options.project_id" in src
+    # 2026-10-07T033205173150Z-pr-1-workspace-as-master-immutable-session-workspace-reviewed-im-755eb4.md line 34 item 3: a passive project filter does not stamp a new session.
+    assert "reqBody.project_id=_activeProject" not in src
 
 
 def test_quick_create_button_attaches_filter_align_and_request_path():
@@ -47,7 +49,10 @@ def test_quick_create_button_attaches_filter_align_and_request_path():
     helper = _extract_function(src, "_attachProjectQuickCreateButton")
     assert "project-chip-quick-create" in helper
     assert "_setActiveProjectFilter(project.project_id)" in helper
-    assert "newSession(false,{project_id:project.project_id})" in helper
+    # 2026-10-07T033205173150Z-pr-1-workspace-as-master-immutable-session-workspace-reviewed-im-755eb4.md line 34 item 3: quick create supplies the chosen workspace explicitly.
+    assert "newSession(false,createOptions)" in helper
+    # 2026-10-07T033205173150Z-pr-1-workspace-as-master-immutable-session-workspace-reviewed-im-755eb4.md line 34 item 3: linked projects open in their exact workspace.
+    assert "workspace=currentLink&&currentLink.path" in helper
     assert "if(_newSessionInFlight)" in helper
     assert "_setActiveProjectFilter(previousProject)" in helper
     assert "btn.ondblclick" in helper
@@ -206,9 +211,10 @@ def test_new_session_respects_explicit_project_id_none():
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
-def test_new_session_falls_back_to_active_project_when_override_missing():
+def test_new_session_does_not_stamp_passive_project_filter():
     body = _run_new_session_case({}, active_project="active-project")
-    assert body["project_id"] == "active-project"
+    # 2026-10-07T033205173150Z-pr-1-workspace-as-master-immutable-session-workspace-reviewed-im-755eb4.md line 34 item 3: derivation is from the workspace, not the filter.
+    assert "project_id" not in body
 
 
 _HELPER = r"""
@@ -257,6 +263,10 @@ globalThis._setActiveProjectFilter = (projectId) => {
   params.calls.push({type: 'set-filter', projectId});
 };
 globalThis._activeProject = params.activeProject;
+globalThis._workspaceList = params.workspaces;
+globalThis.S = {session: {workspace: "/previous"}, _profileDefaultWorkspace: "/default"};
+globalThis.showPromptDialog = async () => params.chosenWorkspace;
+globalThis.loadWorkspaceList = async () => ({workspaces: params.workspaces});
 globalThis.newSession = async (flash, options) => {
   if (globalThis._newSessionInFlight) {
     params.toasts.push('New conversation already in progress');
@@ -330,6 +340,8 @@ def _run_quick_create_case(
     fail_new_session=False,
     new_session_inflight=None,
     new_session_inflight_reject=None,
+    workspaces=None,
+    chosen_workspace="/chosen",
 ):
     payload = {
         "projectId": project_id,
@@ -346,6 +358,8 @@ def _run_quick_create_case(
         "newSessionInFlight": new_session_inflight,
         "newSessionInFlightReject": new_session_inflight_reject,
         "toasts": [],
+        "workspaces": workspaces if workspaces is not None else [{"path": "/linked", "project_id": project_id}],
+        "chosenWorkspace": chosen_workspace,
     }
     result = subprocess.run(
         [NODE, "-e", _HELPER, str(SESSIONS_JS), json.dumps(payload)],
@@ -369,9 +383,11 @@ def test_project_chip_quick_create_keeps_active_filter_and_uses_project_override
     assert out["buttonText"] == "+"
     assert out["buttonAriaLabel"] == "New conversation in this project"
     assert out["filterProjectId"] == "project-123"
-    assert out["newSession"] == {"flash": False, "options": {"project_id": "project-123"}}
+    # 2026-10-07T033205173150Z-pr-1-workspace-as-master-immutable-session-workspace-reviewed-im-755eb4.md line 34 item 3: the project shortcut carries its linked workspace.
+    assert out["newSession"] == {"flash": False, "options": {"project_id": "project-123", "workspace": "/linked"}}
     assert {"type": "set-filter", "projectId": "project-123"} in out["calls"]
-    assert {"type": "new-session", "flash": False, "options": {"project_id": "project-123"}} in out["calls"]
+    # 2026-10-07T033205173150Z-pr-1-workspace-as-master-immutable-session-workspace-reviewed-im-755eb4.md line 34 item 3: the emitted call carries the linked workspace.
+    assert {"type": "new-session", "flash": False, "options": {"project_id": "project-123", "workspace": "/linked"}} in out["calls"]
     assert out["stopCount"] >= 3
     assert out["preventCount"] >= 3
     assert out["stopImmediateCount"] >= 3
@@ -418,3 +434,33 @@ def test_project_chip_quick_create_swallows_duplicate_inflight_rejections():
     assert out["filterProjectId"] == "keep-me"
     assert {"type": "set-filter", "projectId": "project-123"} not in out["calls"]
     assert out["toasts"] == ["New conversation already in progress"]
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_unlinked_project_requires_saved_workspace_choice():
+    out = _run_quick_create_case(
+        "project-123", workspaces=[{"path": "/chosen", "name": "Chosen", "project_id": None}]
+    )
+    # 2026-10-07T033205173150Z-pr-1-workspace-as-master-immutable-session-workspace-reviewed-im-755eb4.md line 34 item 3: an unlinked project needs an explicit workspace choice.
+    assert out["newSession"] == {
+        "flash": False,
+        "options": {"project_id": "project-123", "workspace": "/chosen"},
+    }
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_unlinked_project_rejects_unsaved_path():
+    out = _run_quick_create_case("project-123", workspaces=[], chosen_workspace="/other")
+    # 2026-10-07T033205173150Z-pr-1-workspace-as-master-immutable-session-workspace-reviewed-im-755eb4.md line 18: project joins use saved exact workspace paths.
+    assert "newSession" not in out
+    assert "Choose a saved workspace" in out["toasts"]
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_removed_worktree_project_cannot_create_chat():
+    out = _run_quick_create_case(
+        "project-123",
+        workspaces=[{"path": "/gone", "project_id": "project-123", "worktree": {"done": True}}],
+    )
+    # 2026-10-07T033205173150Z-pr-1-workspace-as-master-immutable-session-workspace-reviewed-im-755eb4.md line 18: existing worktree safety stays in force.
+    assert "newSession" not in out

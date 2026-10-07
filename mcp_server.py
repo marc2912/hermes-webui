@@ -31,7 +31,6 @@ import os
 import re
 import sys
 import time
-import uuid
 from pathlib import Path
 
 from mcp.server import Server
@@ -55,7 +54,9 @@ import api.config as _cfg
 from api.config import (
     STATE_DIR, SESSION_DIR, SESSION_INDEX_FILE, PROJECTS_FILE, HOME,
 )
-from api.models import load_projects, save_projects
+from api.models import (load_projects, create_project_record, rename_project_record,
+                        delete_project_record, ProjectNotFoundError,
+                        ProjectAlreadyExistsError)
 from api.profiles import get_active_profile_name, _is_root_profile, _profiles_match
 
 # ── Apply --profile override before any module uses get_active_profile_name
@@ -262,24 +263,11 @@ async def handle_create_project(arguments: dict) -> list[TextContent]:
         return [TextContent(type="text", text=json.dumps(
             {"error": color_err}, ensure_ascii=False))]
 
-    active = _active_profile()
-    projects = load_projects()
-
-    # Title collision: exact match (consistent with ensure_cron_project)
-    if any(p.get("name") == name and _profiles_match(p.get("profile"), active)
-           for p in projects):
+    try:
+        proj = create_project_record(name, color, _active_profile(), reject_duplicate_name=True)
+    except ProjectAlreadyExistsError as exc:
         return [TextContent(type="text", text=json.dumps(
-            {"error": f"Project '{name}' already exists"}, ensure_ascii=False))]
-
-    proj = {
-        "project_id": uuid.uuid4().hex[:12],
-        "name": name,
-        "color": color,
-        "profile": active,
-        "created_at": time.time(),
-    }
-    projects.append(proj)
-    save_projects(projects)
+            {"error": str(exc)}, ensure_ascii=False))]
 
     proj["session_count"] = 0
     return [TextContent(type="text", text=json.dumps(proj, ensure_ascii=False, indent=2))]
@@ -299,22 +287,12 @@ async def handle_rename_project(arguments: dict) -> list[TextContent]:
         return [TextContent(type="text", text=json.dumps(
             {"error": color_err}, ensure_ascii=False))]
 
-    active = _active_profile()
-    projects = load_projects()
-    proj = next((p for p in projects if p["project_id"] == project_id), None)
-    if not proj:
+    try:
+        kwargs = {"color": color} if color is not None else {}
+        proj = rename_project_record(project_id, name, _active_profile(), **kwargs)
+    except ProjectNotFoundError:
         return [TextContent(type="text", text=json.dumps(
             {"error": "Project not found"}, ensure_ascii=False))]
-
-    # #1614: profile ownership check
-    if not _profiles_match(proj.get("profile"), active):
-        return [TextContent(type="text", text=json.dumps(
-            {"error": "Project not found"}, ensure_ascii=False))]
-
-    proj["name"] = name
-    if color is not None:
-        proj["color"] = color
-    save_projects(projects)
     return [TextContent(type="text", text=json.dumps(proj, ensure_ascii=False, indent=2))]
 
 
@@ -325,21 +303,31 @@ async def handle_delete_project(arguments: dict) -> list[TextContent]:
         return [TextContent(type="text", text=json.dumps(
             {"error": "project_id is required"}, ensure_ascii=False))]
 
-    active = _active_profile()
-    projects = load_projects()
-    proj = next((p for p in projects if p["project_id"] == project_id), None)
-    if not proj:
+    try:
+        result = delete_project_record(
+            project_id, _active_profile(), clear_sessions=_clear_deleted_project_sessions_mcp,
+        )
+    except ProjectNotFoundError:
         return [TextContent(type="text", text=json.dumps(
             {"error": "Project not found"}, ensure_ascii=False))]
-
-    # #1614: profile ownership check
-    if not _profiles_match(proj.get("profile"), active):
+    except Exception as exc:
         return [TextContent(type="text", text=json.dumps(
-            {"error": "Project not found"}, ensure_ascii=False))]
+            {"error": f"Could not delete project: {type(exc).__name__}"}, ensure_ascii=False))]
 
-    projects = [p for p in projects if p["project_id"] != project_id]
-    save_projects(projects)
+    response = {
+        "ok": True,
+        "deleted": result["deleted_project"]["name"],
+        "unassigned_sessions": result["session_clearing"]["unassigned_sessions"],
+        "unlinked_workspace_ids": result["unlinked_workspace_ids"],
+        "reparented_project_ids": result["reparented_project_ids"],
+    }
+    if "warning" in result["session_clearing"]:
+        response["warning"] = result["session_clearing"]["warning"]
+    return [TextContent(type="text", text=json.dumps(response, ensure_ascii=False))]
 
+
+def _clear_deleted_project_sessions_mcp(project_id):
+    """Unassign only through authenticated WebUI APIs, outside the file lock."""
     # Unassign sessions only when we can do it cache-safely via the HTTP API.
     # The previous filesystem fallback wrote session_data directly with
     # os.replace(), which bypassed _write_session_index() in api/models.py
@@ -352,15 +340,13 @@ async def handle_delete_project(arguments: dict) -> list[TextContent]:
     # refuse and surface the limitation so the operator can act.
     has_auth = bool(_api_password())
     if not has_auth:
-        return [TextContent(type="text", text=json.dumps({
-            "ok": True,
-            "deleted": proj["name"],
+        return {
             "unassigned_sessions": 0,
             "warning": "Set HERMES_WEBUI_PASSWORD to unassign sessions; "
                        "without auth the session index cannot be safely "
                        "updated and direct filesystem writes would cause "
                        "index drift in a running WebUI.",
-        }, ensure_ascii=False))]
+        }
 
     unassigned = 0
     if SESSION_DIR.exists():
@@ -378,11 +364,7 @@ async def handle_delete_project(arguments: dict) -> list[TextContent]:
             except Exception:
                 pass
 
-    return [TextContent(type="text", text=json.dumps({
-        "ok": True,
-        "deleted": proj["name"],
-        "unassigned_sessions": unassigned,
-    }, ensure_ascii=False))]
+    return {"unassigned_sessions": unassigned}
 
 
 # ═══════════════════════════════════════════════════════════════════════════

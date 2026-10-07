@@ -36,7 +36,7 @@ from api.config import (
     LOCK, STREAMS, STREAMS_LOCK, DEFAULT_WORKSPACE, DEFAULT_MODEL, PROJECTS_FILE, HOME,
     get_effective_default_model, _get_session_agent_lock,
 )
-from api.workspace import get_last_workspace, _resolve_path, profile_home_resolve_cache_scope
+from api.workspace import get_last_workspace, _profile_default_workspace, _resolve_path, profile_home_resolve_cache_scope, WORKSPACE_PROJECT_LOCK
 from api.usage import prompt_cache_hit_percent
 from api.agent_sessions import (
     _is_continuation_session,
@@ -1466,7 +1466,7 @@ class Session:
                  model_provider=None,
                  messages=None, created_at=None, updated_at=None,
                  tool_calls=None, pinned: bool=False, archived: bool=False,
-                 project_id: str=None, profile=None,
+                 project_id: str=None, project_source=None, workspace_recovered_from=None, profile=None,
                  input_tokens: int=0, output_tokens: int=0, estimated_cost=None,
                  cache_read_tokens: int=0, cache_write_tokens: int=0,
                  personality=None,
@@ -1554,6 +1554,11 @@ class Session:
         self.pinned = bool(pinned)
         self.archived = bool(archived)
         self.project_id = project_id or None
+        # A pre-PR1 tagged session is an explicit assignment, even when empty.
+        self.project_source = (
+            project_source if project_source in ('explicit', 'derived', 'worktree') else 'explicit'
+        ) if self.project_id else None
+        self.workspace_recovered_from = workspace_recovered_from
         self.profile = profile
         self.input_tokens = input_tokens or 0
         self.output_tokens = output_tokens or 0
@@ -1688,7 +1693,7 @@ class Session:
         # Fields are listed in the order they should appear in the JSON file.
         METADATA_FIELDS = [
             'session_id', 'title', 'workspace', 'created_workspace', 'model', 'model_provider', 'model_explicit_pick_signature', 'created_at', 'updated_at',
-            'pinned', 'archived', 'project_id', 'profile',
+            'pinned', 'archived', 'project_id', 'project_source', 'workspace_recovered_from', 'profile',
             'input_tokens', 'output_tokens', 'estimated_cost',
             'cache_read_tokens', 'cache_write_tokens',
             'personality', 'active_stream_id',
@@ -2188,6 +2193,8 @@ class Session:
             'pinned': self.pinned,
             'archived': self.archived,
             'project_id': self.project_id,
+            'project_source': self.project_source,
+            'workspace_recovered_from': self.workspace_recovered_from,
             'profile': self.profile,
             'input_tokens': self.input_tokens,
             'output_tokens': self.output_tokens,
@@ -6554,7 +6561,7 @@ def _profile_default_model_state(profile=None):
     return default_model or get_effective_default_model(), default_provider
 
 
-def new_session(workspace=None, model=None, profile=None, model_provider=None, project_id=None, worktree_info=None, enabled_toolsets=None):
+def new_session(workspace=None, model=None, profile=None, model_provider=None, project_id=None, worktree_info=None, enabled_toolsets=None, project_source=None):
     """Create a new in-memory session.
 
     The session lives in the SESSIONS dict only — no disk write happens until
@@ -6597,11 +6604,12 @@ def new_session(workspace=None, model=None, profile=None, model_provider=None, p
     wt = worktree_info if isinstance(worktree_info, dict) else None
     workspace_path = (wt.get('path') if wt and wt.get('path') else workspace) if wt else workspace
     s = Session(
-        workspace=workspace_path or get_last_workspace(profile=profile),
+        workspace=workspace_path or _profile_default_workspace(profile=profile),
         model=effective_model,
         model_provider=effective_model_provider,
         profile=profile,
         project_id=project_id,
+        project_source=project_source,
         personality=None,
         worktree_path=wt.get('path') if wt else None,
         worktree_branch=wt.get('branch') if wt else None,
@@ -7142,6 +7150,7 @@ def persist_recovered_workspace_binding(
     workspace: str | Path,
     *,
     expected_workspace=_EXPECTED_WORKSPACE_UNSET,
+    recovered_from=None,
 ):
     """Atomically persist only a recovered session's workspace binding.
 
@@ -7163,6 +7172,7 @@ def persist_recovered_workspace_binding(
         else expected_workspace
     )
     expected = str(expected_value or "")
+    recorded_from = str(recovered_from or expected or "") or None
     path = SESSION_DIR / f"{sid}.json"
     lock = _get_session_agent_lock(sid)
     with lock:
@@ -7191,6 +7201,7 @@ def persist_recovered_workspace_binding(
                     "Failed to persist recovered workspace: session workspace changed"
                 )
             payload["workspace"] = resolved
+            payload["workspace_recovered_from"] = recorded_from
             tmp = path.with_suffix(
                 f".tmp.{os.getpid()}.{threading.current_thread().ident}"
             )
@@ -7209,11 +7220,15 @@ def persist_recovered_workspace_binding(
                     "Failed to persist recovered workspace"
                 ) from exc
 
+        if current == resolved:
+            recorded_from = payload.get("workspace_recovered_from")
         session.workspace = resolved
+        session.workspace_recovered_from = recorded_from
         with LOCK:
             cached = SESSIONS.get(sid)
             if cached is not None:
                 cached.workspace = resolved
+                cached.workspace_recovered_from = recorded_from
         try:
             _write_session_index(updates=[cached or session])
         except Exception:
@@ -8050,7 +8065,7 @@ def title_from(messages, fallback: str='Untitled'):
 
 # ── Project helpers ──────────────────────────────────────────────────────────
 
-_PROJECTS_MIGRATION_LOCK = threading.Lock()
+_PROJECTS_MIGRATION_LOCK = WORKSPACE_PROJECT_LOCK
 _projects_migrated = False
 
 
@@ -8111,37 +8126,160 @@ def load_projects(*, _migrate: bool = True) -> list:
         return []
     if _migrate and not _projects_migrated:
         with _PROJECTS_MIGRATION_LOCK:
-            # Re-check inside the lock — another thread may have raced.
+            # Preserve the once-per-process #1614 profile backfill independently
+            # of the PR1 parent_id schema migration.
             if _projects_migrated:
-                # Per Opus advisor on stage-293: another thread completed
-                # migration and wrote new state to disk while we waited for
-                # the lock. Our `projects` snapshot is the pre-migration
-                # version; re-read so the caller doesn't see stale untagged
-                # rows (which a mutation route could then write back,
-                # silently overwriting the migration).
                 try:
-                    return json.loads(PROJECTS_FILE.read_text(encoding='utf-8'))
+                    projects = json.loads(PROJECTS_FILE.read_text(encoding='utf-8'))
                 except Exception:
                     return projects
-            if _backfill_project_profiles_if_needed(projects):
+            else:
+                try:
+                    projects = json.loads(PROJECTS_FILE.read_text(encoding='utf-8'))
+                except Exception:
+                    return projects
+                if _backfill_project_profiles_if_needed(projects):
+                    try:
+                        save_projects(projects)
+                        _projects_migrated = True
+                    except Exception:
+                        logger.debug("Failed to persist project profile backfill")
+                else:
+                    _projects_migrated = True
+    if _migrate and any('parent_id' not in p for p in projects):
+        with _PROJECTS_MIGRATION_LOCK:
+            # Re-read at this write edge; never persist a stale project list.
+            try:
+                projects = json.loads(PROJECTS_FILE.read_text(encoding='utf-8'))
+            except Exception:
+                return projects
+            changed = False
+            for project in projects:
+                if 'parent_id' not in project:
+                    project['parent_id'] = None
+                    changed = True
+            if changed:
                 try:
                     save_projects(projects)
-                    _projects_migrated = True
                 except Exception:
-                    logger.debug("Failed to persist project profile backfill")
-                    # Leave _projects_migrated False so a future call retries.
-            else:
-                # Nothing to migrate — already tagged.
-                _projects_migrated = True
+                    logger.debug("Failed to persist project parent_id migration")
     return projects
 
 def save_projects(projects) -> None:
     """Write project list to disk."""
-    PROJECTS_FILE.write_text(json.dumps(projects, ensure_ascii=False, indent=2), encoding='utf-8')
+    with WORKSPACE_PROJECT_LOCK:
+        PROJECTS_FILE.write_text(json.dumps(projects, ensure_ascii=False, indent=2), encoding='utf-8')
+
+
+class ProjectNotFoundError(LookupError):
+    """A project is absent or belongs to another profile."""
+
+
+class ProjectAlreadyExistsError(ValueError):
+    """An exact project name is already owned by this profile."""
+
+
+_UNCHANGED_PROJECT_COLOR = object()
+
+
+def create_project_record(name, color, profile, *, reject_duplicate_name=False,
+                          load_fn=None, save_fn=None):
+    """Create one project under the shared project/workspace writer lock."""
+    from api.profiles import _profiles_match
+    load_fn = load_fn or load_projects
+    save_fn = save_fn or save_projects
+    with WORKSPACE_PROJECT_LOCK:
+        projects = load_fn()
+        if reject_duplicate_name and any(
+            p.get('name') == name and _profiles_match(p.get('profile'), profile)
+            for p in projects
+        ):
+            raise ProjectAlreadyExistsError(f"Project '{name}' already exists")
+        project = {
+            'project_id': uuid.uuid4().hex[:12], 'parent_id': None,
+            'name': name, 'color': color, 'profile': profile,
+            'created_at': time.time(),
+        }
+        save_fn([*projects, project])
+        return project
+
+
+def rename_project_record(project_id, name, profile, *, color=_UNCHANGED_PROJECT_COLOR,
+                          load_fn=None, save_fn=None):
+    """Rename only a project owned by the selected profile."""
+    from api.profiles import _profiles_match
+    load_fn = load_fn or load_projects
+    save_fn = save_fn or save_projects
+    with WORKSPACE_PROJECT_LOCK:
+        projects = load_fn()
+        project = next((p for p in projects if p.get('project_id') == project_id), None)
+        if project is None or not _profiles_match(project.get('profile'), profile):
+            raise ProjectNotFoundError('Project not found')
+        project['name'] = name
+        if color is not _UNCHANGED_PROJECT_COLOR:
+            project['color'] = color
+        save_fn(projects)
+        return project
+
+
+def delete_project_record(project_id, profile, *, clear_sessions,
+                          load_projects_fn=None, save_projects_fn=None,
+                          load_workspaces_fn=None, save_workspaces_fn=None):
+    """Delete a project and its workspace links, then clear session tags.
+
+    The file mutation holds the process-local shared lock. The injected session
+    strategy runs after it, so an MCP HTTP call or WebUI session save cannot
+    hold the project/workspace lock across a separate state owner.
+    """
+    from api.profiles import _profiles_match
+    from api.workspace import load_workspaces, save_workspaces
+    load_projects_fn = load_projects_fn or load_projects
+    save_projects_fn = save_projects_fn or save_projects
+    load_workspaces_fn = load_workspaces_fn or load_workspaces
+    save_workspaces_fn = save_workspaces_fn or save_workspaces
+    with WORKSPACE_PROJECT_LOCK:
+        projects = load_projects_fn()
+        deleted = next((p for p in projects if p.get('project_id') == project_id), None)
+        if deleted is None or not _profiles_match(deleted.get('profile'), profile):
+            raise ProjectNotFoundError('Project not found')
+        remaining = [p for p in projects if p.get('project_id') != project_id]
+        reparented_ids = []
+        for child in remaining:
+            if child.get('parent_id') == project_id:
+                child['parent_id'] = deleted.get('parent_id')
+                reparented_ids.append(child['project_id'])
+        workspaces = load_workspaces_fn(profile=profile)
+        unlinked_ids = []
+        for row in workspaces:
+            if row.get('project_id') == project_id:
+                row['project_id'] = None
+                unlinked_ids.append(row.get('workspace_id'))
+        try:
+            if unlinked_ids:
+                save_workspaces_fn(workspaces, profile=profile)
+            save_projects_fn(remaining)
+        except Exception:
+            if unlinked_ids:
+                try:
+                    current = load_workspaces_fn(profile=profile)
+                    for row in current:
+                        if row.get('workspace_id') in unlinked_ids and row.get('project_id') is None:
+                            row['project_id'] = project_id
+                    save_workspaces_fn(current, profile=profile)
+                except Exception:
+                    logger.exception('Could not restore project workspace links after delete failure')
+            raise
+    session_outcome = clear_sessions(project_id)
+    return {
+        'deleted_project': deleted,
+        'unlinked_workspace_ids': unlinked_ids,
+        'reparented_project_ids': reparented_ids,
+        'session_clearing': session_outcome,
+    }
 
 
 CRON_PROJECT_NAME = 'Cron Jobs'
-_CRON_PROJECT_LOCK = threading.Lock()
+_CRON_PROJECT_LOCK = WORKSPACE_PROJECT_LOCK
 
 
 def ensure_cron_project(create: bool = True, profile: str | None = None) -> str | None:
@@ -8196,6 +8334,7 @@ def ensure_cron_project(create: bool = True, profile: str | None = None) -> str 
         project_id = uuid.uuid4().hex[:12]
         projects.append({
             'project_id': project_id,
+            'parent_id': None,
             'name': CRON_PROJECT_NAME,
             'color': '#6366f1',
             'profile': active,
@@ -8206,7 +8345,7 @@ def ensure_cron_project(create: bool = True, profile: str | None = None) -> str 
 
 
 WEBHOOK_PROJECT_NAME = 'Webhooks'
-_WEBHOOK_PROJECT_LOCK = threading.Lock()
+_WEBHOOK_PROJECT_LOCK = WORKSPACE_PROJECT_LOCK
 
 
 def ensure_webhook_project(profile: str | None = None) -> str:
@@ -8233,6 +8372,7 @@ def ensure_webhook_project(profile: str | None = None) -> str:
         project_id = uuid.uuid4().hex[:12]
         projects.append({
             'project_id': project_id,
+            'parent_id': None,
             'name': WEBHOOK_PROJECT_NAME,
             'color': '#0ea5e9',
             'profile': active,

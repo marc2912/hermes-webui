@@ -41,6 +41,42 @@ from correctness checks; include the shared helper and its reconciliation caller
 and report row count, interpreter and base revision with timings. Use synthetic
 rows or isolated copies, never production session state.
 
+## Workspace and project manual checks
+
+Use disposable profiles, directories, and sessions with isolated `HERMES_HOME`
+and `HERMES_WEBUI_STATE_DIR`. Record before/after screenshots at desktop,
+narrow desktop (for example 800px), and mobile (<640px). The checks below are
+for integration QA; listing them here does not mean they have been run.
+
+| Check | Desktop | Narrow desktop | Mobile |
+| --- | --- | --- | --- |
+| Add workspace | Create with the default project link; confirm the separate project name tracks workspace name until edited. Choose an optional project color. Opt out once and confirm no project. Check the duplicate-name warning. | Confirm form fields, checkbox, and buttons fit without clipping. | Open Spaces from the drawer and check keyboard, scrolling, and all form actions remain reachable. |
+| Existing data and linking | Load an old workspace and project fixture: fields migrate without creating links or dropping a missing-path entry. Confirm repeated loads keep the same IDs and a failed save returns an error. An unlinked workspace shows **Create project**, while Home does not. The API can also link an existing unlinked project; reject linking Home or a project already owned by another workspace. | Check the unlinked workspace hint and action remain visible. | Confirm **Create project** works from the drawer. |
+| New chat and project chip | From a linked workspace, start New conversation: it inherits that workspace, opens no picker, and shows the derived project. With no previous session, it uses the profile default. A project filter alone must not assign its ID. Chip **+** opens the linked workspace; an unlinked project's **+** prompts for a saved workspace path. | Confirm chip and workspace path remain readable. | Confirm chip **+**, saved-path prompt, and drawer close/open behavior. |
+| Empty and populated switches | On an empty session, change workspace and confirm the derived project chip updates; an explicit or legacy tagged assignment stays. Send a message, choose another workspace, and confirm a new chat opens while the original retains its workspace and history. Choosing the same workspace only refreshes files. | Confirm dropdown, transcript, and draft remain usable. | Confirm workspace selection starts the correct chat and preserves an unsent draft. |
+| Removal and settings | Rename a workspace and confirm its project name changes only when separately requested. Remove a workspace and confirm its project and session history remain. Delete a project and confirm its session tags/source and workspace link clear, while messages remain. Confirm the old in-place workspace-switch setting is absent and a saved legacy value is ignored. | Confirm confirmation text and Controls fit. | Confirm confirmation and Settings can be reached without horizontal overflow. |
+| Profile and remote paths | In a second profile, confirm foreign workspace/project links cannot be made. For an SSH/Docker profile fixture, confirm target-side POSIX paths and missing host paths survive list, link, and chat creation without host-local path rewriting. | Confirm path text can be inspected. | Confirm long remote paths do not block controls. |
+| Deleted local folder | Delete the previous session's folder, then start New conversation: confirm it uses the configured profile default and has no derived project. For a bound empty session, delete its folder and send its first message; confirm recovery records the old path without changing its project. For a populated session, attempt a chat send and confirm the folder-missing error. | Confirm any file-refresh recovery notice and the chat error remain readable. | Confirm any notice and the error fit without covering the composer. |
+
+When checking the API, assert `project_source` is the persisted session value:
+`explicit` for a supplied or manually moved project, `derived` for an exact
+workspace link, and null when unassigned. The schema accepts `worktree`, but
+worktree creation does not currently stamp that source. Existing tagged sessions
+with no source behave as explicit.
+`/api/session/update` must reject a different workspace after the first message
+with `workspace_immutable`, without changing the saved workspace.
+Delete an empty session's bound local folder and verify recovery records
+`workspace_recovered_from` while retaining `project_id` and `project_source`.
+For a chat request on a session with messages, a deleted bound local folder
+should return HTTP 400 with `code: workspace_missing` and "Session workspace
+folder no longer exists"; an explicit switch to a different live folder
+should return HTTP 400 with `code: workspace_immutable` and "Workspace is
+immutable after the first message". A remote terminal path must not be
+classified as deleted by the WebUI host. `POST /api/workspaces/link-project`
+accepts `workspace_id` with either `project_id` or `project_name`: check 409
+for an already linked workspace or project, 400 `not_linkable` for Home, and
+404 for a missing or foreign ID.
+
 ## Session-scoped media authorization
 
 Run `./scripts/test.sh tests/test_media_inline.py tests/test_media_session_preview_auth.py`.
@@ -654,18 +690,16 @@ FAIL: Error, spinner never stops, tree clears without reloading.
 
 ## Section 6: Workspace Path
 
-### T6.1: Change Workspace Path
-SETUP: Active session.
+### T6.1: Choose Workspace for Chat
+SETUP: Active disposable session and another configured workspace.
 STEPS:
-  1. Click the workspace path display in the sidebar bottom (shows current path)
-  2. A prompt dialog appears
-  3. Enter a new valid path (e.g. /tmp)
-  4. Click OK
+  1. Open the **Switch workspace** dropdown in the composer footer
+  2. Select the other workspace
 EXPECT:
-  - Workspace chip in topbar updates to show the last segment of the new path
-  - File tree refreshes to show files at the new path
-  - Next message sent uses the new workspace
-FAIL: Dialog does not appear, path not saved, error on invalid path.
+  - An empty session switches workspace and updates its derived project chip
+  - A session with a message starts a new chat in the selected workspace
+  - The original populated session keeps its workspace and history
+FAIL: Populated session changes workspace in place, or files/chip show the wrong path.
 
 ---
 
@@ -1043,7 +1077,7 @@ SETUP: Active session with workspace changed to a non-default path (e.g. /tmp).
 STEPS:
   1. Click + New conversation while workspace is set to /tmp
 EXPECT:
-  - New session shows /tmp in the workspace chip and path display
+  - New session shows /tmp in the workspace chip and path display without opening a picker
   - File tree shows files from /tmp
 FAIL: New session resets to default test-workspace.
 
@@ -1262,66 +1296,72 @@ STEPS:
 EXPECT:
   - A list of workspaces with name and path
   - At least the default workspace (test-workspace) listed
-  - An "Add workspace path" input at the bottom
-  - Each workspace has "Use" and X (remove) buttons
+  - An action opens the add-workspace form
+  - Workspace details have actions to use and rename; only non-default workspaces can be removed
 FAIL: Empty panel, loading forever, error.
 
 ### T22.2: Add a Valid Workspace Path
 STEPS:
-  1. Type "/tmp" in the add input and click + Add
+  1. Open the add-workspace form, enter a disposable path, and leave **Create a project for this workspace** checked
+  2. Enter a project name and optionally enable **Use this color**
+  3. Save the form
 EXPECT:
-  - "/tmp" appears in the list with name "tmp"
+  - The workspace appears in the list with its name and path
+  - A linked project appears with the chosen project name
   - Toast: "Workspace added"
 FAIL: Error shown, path not saved, no feedback.
 
 ### T22.3: Add an Invalid Path is Rejected
 STEPS:
-  1. Type "/this/path/does/not/exist" in the add input and click + Add
+  1. Enter "/this/path/does/not/exist" in the add-workspace form and save without creating the directory
 EXPECT:
-  - Status bar shows an error (e.g. "Path does not exist")
+  - The form shows an inline error (e.g. "Path does not exist")
   - Path is NOT added to the list
 FAIL: Invalid path added, no error.
 
 ### T22.4: Remove a Workspace
 STEPS:
-  1. Click the X button next to any non-default workspace
+  1. Choose Remove for any non-default workspace
   2. Confirm the modal
 EXPECT:
   - Workspace disappears from the list
+  - Its linked project and conversation history remain
   - Toast: "Workspace removed"
 FAIL: Workspace stays, no confirmation, error.
 
-### T22.5: Topbar Workspace Chip is a Dropdown
+### T22.5: Composer Workspace Chip is a Dropdown
 STEPS:
-  1. In any active chat session, look at the topbar right side
-  2. Click the workspace chip (shows folder icon + workspace name + arrow)
+  1. In any active chat session, look at the composer footer
+  2. Click **Switch workspace** (the workspace chip with folder icon, name, and arrow)
 EXPECT:
   - A dropdown appears listing all configured workspaces
   - Current workspace is highlighted
   - A "Manage workspaces" link at the bottom
 FAIL: Nothing happens, no dropdown, error.
 
-### T22.6: Quick-Switch Workspace via Topbar
+### T22.6: Choose Workspace via Composer
 SETUP: At least two workspaces configured (add /tmp if needed via Spaces tab).
 STEPS:
-  1. Click the workspace chip to open the dropdown
+  1. Click the composer workspace chip to open the dropdown
   2. Click a different workspace than the current one
 EXPECT:
   - Dropdown closes
-  - Toast: "Switched to [name]"
-  - Workspace chip in topbar updates to the new workspace name
-  - File tree in right panel refreshes to show files in the new workspace
-  - Current session is now using the new workspace
-FAIL: Workspace chip doesn't update, file tree unchanged, error.
+  - Empty session: workspace and derived project chip update in place
+  - Populated session: a new chat opens in the selected workspace, with a "Started a new chat in [name]" toast; the old chat keeps its workspace
+  - Selecting the current workspace stays in place and refreshes the file view
+  - File tree refreshes for the selected workspace
+FAIL: Populated session changes workspace in place, file tree unchanged, or error.
 
-### T22.7: New Session Inherits Last Used Workspace
-SETUP: Switch to a non-default workspace (e.g. /tmp) via the topbar dropdown.
+### T22.7: New Session Inherits Previous Session Workspace
+SETUP: Active session in a non-default workspace (e.g. /tmp).
 STEPS:
   1. Click + New conversation
 EXPECT:
-  - New session's workspace chip shows the same workspace you last switched to (/tmp)
+  - New session's workspace chip shows the previous session's workspace (/tmp)
   - File tree shows files from /tmp
-FAIL: New session defaults back to test-workspace.
+  - No workspace picker opens
+  - If that previous folder was deleted, the new session uses the configured profile default, not the last visited workspace
+FAIL: An existing previous folder is ignored, a deleted previous folder uses the last-visited path, or a picker opens.
 
 ---
 
@@ -1403,7 +1443,7 @@ FAIL: Save fails, markdown not re-rendered.
 Sprint 5 tests (test_sprint5.py) - 18 tests:
   - Phase A: app.js served correctly
   - Workspace CRUD: list, add valid, add invalid path, add invalid dir, add duplicate, requires path, remove, rename, rename unknown
-  - Last workspace tracking: updates on session/update, new session inherits last
+  - Last-workspace preference tracking; New conversation now inherits the visible previous session or uses the configured profile default
   - File save: success, missing fields, nonexistent file 404, path traversal blocked
   - Session index: created after save, sessions sorted correctly
 

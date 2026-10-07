@@ -11197,6 +11197,10 @@ from api.models import (
     _active_state_db_path,
     load_projects,
     save_projects,
+    create_project_record,
+    rename_project_record,
+    delete_project_record,
+    ProjectNotFoundError,
     import_cli_session,
     CLAUDE_CODE_SOURCE,
     get_cli_sessions,
@@ -11450,6 +11454,7 @@ from api.workspace import (
     rename_anchored,
     make_anchored_dir,
     validate_workspace_to_add,
+    WORKSPACE_PROJECT_LOCK,
     _is_blocked_system_path,
     _home_path,
     _is_within,
@@ -15179,9 +15184,13 @@ def handle_get(handler, parsed) -> bool:
         from api.profiles import get_active_profile_name
         active_profile = get_active_profile_name()
         try:
-            wss = load_workspaces(profile=active_profile)
-        except TypeError:
-            wss = load_workspaces()
+            try:
+                wss = load_workspaces(profile=active_profile)
+            except TypeError:
+                wss = load_workspaces()
+            wss = _mark_default_workspace_rows(wss, active_profile)
+        except (OSError, ValueError) as exc:
+            return bad(handler, f"Could not load workspaces: {_sanitize_error(exc)}", 500)
         try:
             lw = get_last_workspace(profile=active_profile)
         except TypeError:
@@ -15925,15 +15934,129 @@ def _resolve_new_session_workspace(body, visible_prev_session_id, profile=None):
     try:
         workspace, _recovered = resolve_implicit_workspace_with_recovery(
             candidate,
-            get_last_workspace,
+            _profile_default_for_new_session,
             profile=profile,
         )
     except TypeError:
         workspace, _recovered = resolve_implicit_workspace_with_recovery(
             candidate,
-            get_last_workspace,
+            lambda: _profile_default_for_new_session(profile),
         )
     return str(workspace)
+
+
+def _clear_deleted_project_sessions_http(project_id):
+    """Clear tags through the WebUI cache/stream owner after project-file writes."""
+    outcome = {"cleared": 0, "deferred_to_stream": 0, "failed": 0}
+    # Unassign all sessions that belonged to this project.
+    # #3746: this loop is O(N) full-JSON read+save per session, and each
+    # save() reserializes the entire messages array. For a project with many
+    # messageful sessions that throughput alone can blow past the client's
+    # 30s timeout. For an actively-streaming session we must NOT issue our own
+    # s.save() — it would race the streaming thread's atomic writer and it
+    # carries the largest in-memory message array. Instead we clear project_id
+    # on the live cached Session object (under LOCK); the streaming thread owns
+    # that object and persists it on its next checkpoint/final save (the worker
+    # always does a final s.save() at turn completion), so the unlink still
+    # lands without a competing write. (If the streaming session isn't in the
+    # cache for some reason, fall back to a direct save.) Guard each per-session
+    # update so one slow/failing session can't abort the whole request.
+    if SESSION_INDEX_FILE.exists():
+        try:
+            index = json.loads(SESSION_INDEX_FILE.read_bytes())
+            active_ids = _active_stream_ids()
+            deferred_to_stream = []
+            for entry in index:
+                if entry.get("project_id") != project_id:
+                    continue
+                sid = entry.get("session_id")
+                try:
+                    if entry.get("active_stream_id") in active_ids:
+                        # Clear on the live cached object so the streaming
+                        # thread's own next save persists project_id=None.
+                        cleared_in_cache = False
+                        with LOCK:
+                            cached = SESSIONS.get(sid)
+                            if cached is not None:
+                                cached.project_id = None
+                                cached.project_source = None
+                                cleared_in_cache = True
+                        if cleared_in_cache:
+                            deferred_to_stream.append(sid)
+                            outcome["deferred_to_stream"] += 1
+                            continue
+                        # Not cached — fall through to a direct save.
+                    s = get_session(sid)
+                    s.project_id = None
+                    s.project_source = None
+                    s.save()
+                    outcome["cleared"] += 1
+                except Exception:
+                    outcome["failed"] += 1
+                    logger.debug("Failed to update session %s", sid)
+            if deferred_to_stream:
+                logger.info(
+                    "projects/delete: cleared project_id on %d streaming session(s) "
+                    "in-cache; streaming thread will persist: %s",
+                    len(deferred_to_stream), deferred_to_stream,
+                )
+        except Exception:
+            outcome["failed"] += 1
+            logger.debug("Failed to load session index for project unlink")
+    return outcome
+
+
+def _workspace_project_for_path(path, profile):
+    """Derive only from a workspace in the same profile with an exact path."""
+    from api.workspace import _profile_default_workspace
+    if path == str(_resolve_path(_profile_default_workspace(profile=profile), profile=profile)):
+        return None
+    with WORKSPACE_PROJECT_LOCK:
+        for row in load_workspaces(profile=profile):
+            if row.get("path") == path:
+                pid = row.get("project_id")
+                if pid and any(
+                    p.get("project_id") == pid and _profiles_match(p.get("profile"), profile)
+                    for p in load_projects()
+                ):
+                    return pid
+    return None
+
+
+def _mark_default_workspace_rows(rows, profile):
+    """Expose the current configured Home marker without storing it on disk."""
+    from api.workspace import _profile_default_workspace
+    default_path = str(_resolve_path(_profile_default_workspace(profile=profile), profile=profile))
+    return [{**row, "is_default": row.get("path") == default_path} for row in rows]
+
+
+def _session_project_source(session):
+    source = getattr(session, "project_source", None)
+    if source in ("explicit", "derived", "worktree"):
+        return source
+    return "explicit" if getattr(session, "project_id", None) else None
+
+
+def _bind_empty_session_workspace(session, workspace):
+    """Bind a first turn to its requested workspace under the session lock."""
+    if workspace == getattr(session, "workspace", None):
+        return
+    if _session_project_source(session) not in ("explicit", "worktree"):
+        session.project_id = _workspace_project_for_path(workspace, getattr(session, "profile", None))
+        session.project_source = "derived" if session.project_id else None
+    session.workspace = workspace
+    session.created_workspace = workspace
+
+
+def _profile_default_for_new_session(profile):
+    # The configured Home path is the API fallback. Last-workspace is a UI
+    # preference and must not silently select a linked project for API callers.
+    from api.workspace import _profile_default_workspace
+    default = _profile_default_workspace(profile=profile)
+    try:
+        return str(resolve_trusted_workspace(default, profile=profile))
+    except TypeError:
+        return str(resolve_trusted_workspace(default))
 
 
 def _llm_update_summary(system_prompt: str, user_prompt: str, active_profile: str | None = None) -> str:
@@ -16364,6 +16487,12 @@ def handle_post(handler, parsed) -> bool:
         )
 
     if parsed.path == "/api/session/new":
+        active_profile = get_active_profile_name()
+        requested_profile = body.get("profile") or active_profile
+        from api.profiles import _PROFILE_ID_RE
+        if (not isinstance(requested_profile, str)
+                or not _PROFILE_ID_RE.fullmatch(requested_profile)):
+            return bad(handler, "Profile not found", 404)
         workspace_prev_session_id = body.get("prev_session_id")
         if workspace_prev_session_id and not _session_id_visible_to_request_profile(
             handler, workspace_prev_session_id, emit_error=False
@@ -16371,10 +16500,21 @@ def handle_post(handler, parsed) -> bool:
             workspace_prev_session_id = None
         try:
             workspace = _resolve_new_session_workspace(
-                body, workspace_prev_session_id, profile=body.get("profile") or None
+                body, workspace_prev_session_id, profile=requested_profile
             )
+            if not workspace:
+                workspace = _profile_default_for_new_session(requested_profile)
         except (TypeError, ValueError) as e:
             return bad(handler, str(e))
+        explicit_pid = body.get("project_id") or None
+        if explicit_pid:
+            project = next((p for p in load_projects() if p.get("project_id") == explicit_pid), None)
+            if project is None or not _profiles_match(project.get("profile"), requested_profile):
+                return bad(handler, "Project not found", 404)
+        try:
+            enabled_toolsets = _validate_session_toolsets_shape(body.get("enabled_toolsets"))
+        except ValueError as e:
+            return bad(handler, str(e), status=400)
         worktree_info = None
         worktree_skipped = None
         # Three-value worktree model (#6022): an explicit body value always
@@ -16401,11 +16541,8 @@ def handle_post(handler, parsed) -> bool:
                 from api.worktrees import create_worktree_for_workspace
                 base_workspace = workspace
                 if not base_workspace:
-                    _new_profile = body.get("profile") or None
-                    try:
-                        _lw = get_last_workspace(profile=_new_profile)
-                    except TypeError:
-                        _lw = get_last_workspace()
+                    _new_profile = requested_profile
+                    _lw = _profile_default_for_new_session(_new_profile)
                     try:
                         base_workspace = str(
                             resolve_trusted_workspace(_lw, profile=_new_profile)
@@ -16431,10 +16568,6 @@ def handle_post(handler, parsed) -> bool:
             body.get("model"),
             body.get("model_provider"),
         )
-        try:
-            enabled_toolsets = _validate_session_toolsets_shape(body.get("enabled_toolsets"))
-        except ValueError as e:
-            return bad(handler, str(e), status=400)
         # Use the profile sent by the client tab (if any) so that two tabs on
         # different profiles never clobber each other via the process-level global.
         # ── Memory lifecycle: commit the previous session before starting a new one ──
@@ -16491,15 +16624,24 @@ def handle_post(handler, parsed) -> bool:
                 # thread the drain snapshot already missed).
                 if _register_background_commit_thread(t):
                     t.start()
+        try:
+            derived_pid = None if explicit_pid or worktree_info else _workspace_project_for_path(workspace, requested_profile)
+        except (OSError, ValueError) as exc:
+            return bad(handler, f"Could not load workspaces: {_sanitize_error(exc)}", 500)
+        project_id = explicit_pid or derived_pid
+        project_source = "explicit" if explicit_pid else "derived" if derived_pid else None
         s = new_session(
             workspace=workspace,
             model=model,
             model_provider=model_provider,
-            profile=body.get("profile") or None,
-            project_id=body.get("project_id") or None,
+            profile=requested_profile,
+            project_id=project_id,
             worktree_info=worktree_info,
             enabled_toolsets=enabled_toolsets,
         )
+        s.project_source = project_source
+        if worktree_info:
+            s.save()
         if worktree_info:
             publish_session_list_changed(
                 "session_new",
@@ -16507,7 +16649,10 @@ def handle_post(handler, parsed) -> bool:
                 session_id=getattr(s, "session_id", None),
             )
         payload = {
-            "session": public_session_projection(s.compact() | {"messages": s.messages})
+            "session": public_session_projection(s.compact() | {"messages": s.messages, "project_source": s.project_source}),
+            "project_source": s.project_source,
+            "workspace_id": next((row.get("workspace_id") for row in load_workspaces(profile=requested_profile)
+                                  if row.get("path") == workspace), None),
         }
         if worktree_skipped:
             # Config-default worktree was skipped (non-git workspace); tell the
@@ -16602,6 +16747,7 @@ def handle_post(handler, parsed) -> bool:
                 created_at=time.time(),
                 updated_at=time.time(),
             )
+            copied_session.project_source = _session_project_source(session)
 
             # Reconciliation can insert SQLite rows before a saved tool owner.
             # Map the original row objects before deepcopy, but update only the
@@ -17027,15 +17173,29 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "Session not found", 404)
         except PermissionError:
             return bad(handler, "Read-only imported sessions cannot be updated from WebUI", 403)
-        old_ws = getattr(s, "workspace", "")
-        old_model = getattr(s, "model", None)
-        old_provider = getattr(s, "model_provider", None)
-        try:
-            new_ws = str(resolve_trusted_workspace(body.get("workspace", s.workspace), profile=getattr(s, "profile", None)))
-        except ValueError as e:
-            return bad(handler, str(e))
         with _get_session_agent_lock(body["session_id"]):
-            s.workspace = new_ws
+            # Re-read the canonical object after waiting for a concurrent first
+            # message. The check and mutation share the turn starter's lock.
+            with LOCK:
+                latest = SESSIONS.get(body["session_id"])
+            s = _ensure_full_session_before_mutation(body["session_id"], latest or s)
+            old_ws = getattr(s, "workspace", "")
+            old_model = getattr(s, "model", None)
+            old_provider = getattr(s, "model_provider", None)
+            try:
+                new_ws = str(resolve_trusted_workspace(body.get("workspace", old_ws), profile=getattr(s, "profile", None)))
+            except ValueError as e:
+                return bad(handler, str(e))
+            if new_ws != old_ws:
+                if (getattr(s, "messages", None) or getattr(s, "context_messages", None)
+                        or getattr(s, "pending_user_message", None) or getattr(s, "active_stream_id", None)):
+                    return j(handler, {"error": "Workspace is immutable after the first message", "code": "workspace_immutable"}, status=400)
+                try:
+                    _bind_empty_session_workspace(s, new_ws)
+                except (OSError, ValueError) as exc:
+                    return bad(handler, f"Could not load workspaces: {_sanitize_error(exc)}", 500)
+                from api.terminal import close_terminal
+                close_terminal(s.session_id)
             if "model" in body or "model_provider" in body:
                 model, provider = _session_model_state_from_request(
                     body.get("model", s.model),
@@ -17059,24 +17219,11 @@ def handle_post(handler, parsed) -> bool:
 
                     _evict_session_agent(body["session_id"])
             s.save()
-        if str(old_ws or "") != str(new_ws or ""):
-            try:
-                from api.terminal import close_terminal
-                close_terminal(body["session_id"])
-            except Exception:
-                logger.debug("Failed to close workspace terminal after workspace update")
-            # Keep state.db's cwd in step with the new workspace so clients that
-            # group by cwd (Hermes Desktop) move the session with it. No-op when
-            # the session has no state.db row yet (never sent a message).
-            # Background: SessionDB retries for ~20 s on a busy state.db and the
-            # response must not wait for optional metadata.
-            try:
+            if new_ws != old_ws:
                 from api.state_sync import sync_session_cwd_background
                 sync_session_cwd_background(
                     lambda _sid=s.session_id: _current_cwd_sync_target(_sid)
                 )
-            except Exception:
-                logger.debug("Failed to schedule session cwd sync after workspace update")
         set_last_workspace(new_ws, profile=getattr(s, "profile", None))
         return j(
             handler,
@@ -17511,6 +17658,7 @@ def handle_post(handler, parsed) -> bool:
             parent_session_id=source.session_id,
             session_source="fork",
         )
+        branch.project_source = _session_project_source(source)
         with LOCK:
             SESSIONS[branch.session_id] = branch
             SESSIONS.move_to_end(branch.session_id)
@@ -17748,6 +17896,9 @@ def handle_post(handler, parsed) -> bool:
     # ── Workspace management (POST) ──
     if parsed.path == "/api/workspaces/add":
         return _handle_workspace_add(handler, body)
+
+    if parsed.path == "/api/workspaces/link-project":
+        return _handle_workspace_link_project(handler, body)
 
     if parsed.path == "/api/workspaces/remove":
         return _handle_workspace_remove(handler, body)
@@ -18489,6 +18640,7 @@ def handle_post(handler, parsed) -> bool:
                 if not _profiles_match(target.get("profile"), _session_profile):
                     return bad(handler, "Project not found", 404)
             s.project_id = target_pid
+            s.project_source = "explicit" if target_pid else None
             s.save()
             with LOCK:
                 SESSIONS[sid] = s
@@ -18517,25 +18669,17 @@ def handle_post(handler, parsed) -> bool:
         color = body.get("color")
         if color and not _re.match(r"^#[0-9a-fA-F]{3,8}$", color):
             return bad(handler, "Invalid color format")
-        projects = load_projects()
-        # #3331 follow-up (Codex+Opus gate): validate the optional client-supplied
-        # `profile` before stamping it, mirroring /api/profile/switch — otherwise a
-        # client could create a project tagged with an arbitrary/unknown profile,
-        # producing hidden cross-profile rows that can't be managed normally.
         _requested_profile = str(body.get('profile') or "").strip()
         if _requested_profile and _requested_profile != "default":
             from api.profiles import _PROFILE_ID_RE
             if not _PROFILE_ID_RE.fullmatch(_requested_profile):
                 return bad(handler, "invalid profile")
-        proj = {
-            "project_id": uuid.uuid4().hex[:12],
-            "name": name,
-            "color": color,
-            "profile": _requested_profile or get_active_profile_name() or 'default',
-            "created_at": time.time(),
-        }
-        projects.append(proj)
-        save_projects(projects)
+        # #3331: keep the existing optional-profile validation above before
+        # delegating the one project-file write to the shared storage helper.
+        proj = create_project_record(
+            name, color, _requested_profile or get_active_profile_name() or 'default',
+            load_fn=load_projects, save_fn=save_projects,
+        )
         return j(handler, {"ok": True, "project": proj})
 
     if parsed.path == "/api/projects/rename":
@@ -18545,23 +18689,19 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, str(e))
         import re as _re
 
-        projects = load_projects()
-        proj = next(
-            (p for p in projects if p["project_id"] == body["project_id"]), None
-        )
-        if not proj:
-            return bad(handler, "Project not found", 404)
-        # #1614: a project can only be renamed by the profile that owns it.
-        active_profile = get_active_profile_name()
-        if not _profiles_match(proj.get("profile"), active_profile):
-            return bad(handler, "Project not found", 404)
-        proj["name"] = body["name"].strip()[:128]
         if "color" in body:
             color = body["color"]
             if color and not _re.match(r"^#[0-9a-fA-F]{3,8}$", color):
                 return bad(handler, "Invalid color format")
-            proj["color"] = color
-        save_projects(projects)
+        try:
+            kwargs = {"color": body["color"]} if "color" in body else {}
+            proj = rename_project_record(
+                body["project_id"], body["name"].strip()[:128],
+                get_active_profile_name(), load_fn=load_projects,
+                save_fn=save_projects, **kwargs,
+            )
+        except ProjectNotFoundError:
+            return bad(handler, "Project not found", 404)
         return j(handler, {"ok": True, "project": proj})
 
     if parsed.path == "/api/projects/delete":
@@ -18569,68 +18709,22 @@ def handle_post(handler, parsed) -> bool:
             require(body, "project_id")
         except ValueError as e:
             return bad(handler, str(e))
-        projects = load_projects()
-        proj = next(
-            (p for p in projects if p["project_id"] == body["project_id"]), None
-        )
-        if not proj:
+        try:
+            result = delete_project_record(
+                body["project_id"], get_active_profile_name(),
+                clear_sessions=_clear_deleted_project_sessions_http,
+                load_projects_fn=load_projects, save_projects_fn=save_projects,
+                load_workspaces_fn=load_workspaces, save_workspaces_fn=save_workspaces,
+            )
+        except ProjectNotFoundError:
             return bad(handler, "Project not found", 404)
-        # #1614: a project can only be deleted by the profile that owns it.
-        active_profile = get_active_profile_name()
-        if not _profiles_match(proj.get("profile"), active_profile):
-            return bad(handler, "Project not found", 404)
-        projects = [p for p in projects if p["project_id"] != body["project_id"]]
-        save_projects(projects)
-        # Unassign all sessions that belonged to this project.
-        # #3746: this loop is O(N) full-JSON read+save per session, and each
-        # save() reserializes the entire messages array. For a project with many
-        # messageful sessions that throughput alone can blow past the client's
-        # 30s timeout. For an actively-streaming session we must NOT issue our own
-        # s.save() — it would race the streaming thread's atomic writer and it
-        # carries the largest in-memory message array. Instead we clear project_id
-        # on the live cached Session object (under LOCK); the streaming thread owns
-        # that object and persists it on its next checkpoint/final save (the worker
-        # always does a final s.save() at turn completion), so the unlink still
-        # lands without a competing write. (If the streaming session isn't in the
-        # cache for some reason, fall back to a direct save.) Guard each per-session
-        # update so one slow/failing session can't abort the whole request.
-        if SESSION_INDEX_FILE.exists():
-            try:
-                index = json.loads(SESSION_INDEX_FILE.read_bytes())
-                active_ids = _active_stream_ids()
-                deferred_to_stream = []
-                for entry in index:
-                    if entry.get("project_id") != body["project_id"]:
-                        continue
-                    sid = entry.get("session_id")
-                    try:
-                        if entry.get("active_stream_id") in active_ids:
-                            # Clear on the live cached object so the streaming
-                            # thread's own next save persists project_id=None.
-                            cleared_in_cache = False
-                            with LOCK:
-                                cached = SESSIONS.get(sid)
-                                if cached is not None:
-                                    cached.project_id = None
-                                    cleared_in_cache = True
-                            if cleared_in_cache:
-                                deferred_to_stream.append(sid)
-                                continue
-                            # Not cached — fall through to a direct save.
-                        s = get_session(sid)
-                        s.project_id = None
-                        s.save()
-                    except Exception:
-                        logger.debug("Failed to update session %s", sid)
-                if deferred_to_stream:
-                    logger.info(
-                        "projects/delete: cleared project_id on %d streaming session(s) "
-                        "in-cache; streaming thread will persist: %s",
-                        len(deferred_to_stream), deferred_to_stream,
-                    )
-            except Exception:
-                logger.debug("Failed to load session index for project unlink")
-        return j(handler, {"ok": True})
+        except Exception as exc:
+            return bad(handler, f"Could not delete project: {_sanitize_error(exc)}", 500)
+        return j(handler, {
+            "ok": True,
+            "unlinked_workspace_ids": result["unlinked_workspace_ids"],
+            "reparented_project_ids": result["reparented_project_ids"],
+        })
 
     # ── Session import from JSON (POST) ──
     if parsed.path == "/api/session/import":
@@ -25016,6 +25110,12 @@ def _start_chat_stream_for_session(
     journal_event = {}
     while True:
         with session_lock:
+            if workspace != getattr(s, "workspace", None) and (
+                getattr(s, "messages", None) or getattr(s, "context_messages", None)
+                or getattr(s, "pending_user_message", None)
+            ):
+                return {"error": "Workspace is immutable after the first message",
+                        "code": "workspace_immutable", "_status": 400}
             locked_stream_id = getattr(s, "active_stream_id", None)
             if locked_stream_id:
                 if _active_stream_blocks_chat_start(s, locked_stream_id):
@@ -25106,6 +25206,7 @@ def _start_chat_stream_for_session(
                 diag.stage("save_pending_state") if diag else None
                 was_hidden_empty_session = _is_hidden_empty_session(s)
                 try:
+                    _bind_empty_session_workspace(s, workspace)
                     _prepare_chat_start_session_for_stream(
                         s,
                         msg=msg,
@@ -25660,6 +25761,8 @@ def start_session_turn(
     except WorkspaceBindingPersistenceError as e:
         return {"error": str(e), "_status": 500}
     except ValueError as e:
+        if str(e) == "workspace_missing":
+            return {"error": "Session workspace folder no longer exists", "code": "workspace_missing", "_status": 400}
         return {"error": str(e), "_status": 400}
 
     requested_model = s.model
@@ -25969,6 +26072,7 @@ def _handle_session_compression_recovery_start(handler, body):
             # empty model-facing transcript so a focused follow-up does not replay the
             # exhausted state.db/context tail.
             copied_session.context_messages = []
+            copied_session.project_source = _session_project_source(source)
             copied_session.composer_draft = {"text": "", "files": []}
             try:
                 copied_session.save()
@@ -26497,6 +26601,8 @@ def _handle_chat_start(handler, body, diag=None):
         except WorkspaceBindingPersistenceError as e:
             return bad(handler, str(e), 500)
         except ValueError as e:
+            if str(e) == "workspace_missing":
+                return j(handler, {"error": "Session workspace folder no longer exists", "code": "workspace_missing"}, status=400)
             return bad(handler, str(e))
         requested_model = body.get("model") or s.model
         requested_provider = (
@@ -26671,9 +26777,37 @@ def _resolve_chat_workspace_with_recovery(s, requested_workspace) -> str:
     explicit = requested_workspace not in (None, "")
     if explicit:
         try:
-            return str(resolve_trusted_workspace(requested_workspace, profile=_session_profile))
-        except TypeError:
-            return str(resolve_trusted_workspace(requested_workspace))
+            try:
+                resolved = str(resolve_trusted_workspace(requested_workspace, profile=_session_profile))
+            except TypeError:
+                resolved = str(resolve_trusted_workspace(requested_workspace))
+        except ValueError:
+            if str(requested_workspace) == str(getattr(s, "workspace", None)):
+                # The recovery helper alone can distinguish a deleted local
+                # folder from an inaccessible path or a remote target path.
+                try:
+                    _workspace, _recovered = resolve_implicit_workspace_with_recovery(
+                        requested_workspace, get_last_workspace, profile=_session_profile
+                    )
+                except ValueError:
+                    pass
+                else:
+                    if _recovered:
+                        if (getattr(s, "messages", None) or getattr(s, "context_messages", None)
+                                or getattr(s, "pending_user_message", None)):
+                            raise ValueError("workspace_missing") from None
+                        persisted = persist_recovered_workspace_binding(
+                            s, _workspace, expected_workspace=getattr(s, "workspace", None),
+                            recovered_from=getattr(s, "workspace", None),
+                        )
+                        return str(persisted.workspace)
+            raise
+        if resolved != getattr(s, "workspace", None) and (
+            getattr(s, "messages", None) or getattr(s, "context_messages", None)
+            or getattr(s, "pending_user_message", None)
+        ):
+            raise ValueError("workspace_immutable")
+        return resolved
     stored_workspace = getattr(s, "workspace", None)
     try:
         workspace, recovered = resolve_implicit_workspace_with_recovery(
@@ -26688,10 +26822,14 @@ def _resolve_chat_workspace_with_recovery(s, requested_workspace) -> str:
         )
     if not recovered:
         return str(workspace)
+    if (getattr(s, "messages", None) or getattr(s, "context_messages", None)
+            or getattr(s, "pending_user_message", None)):
+        raise ValueError("workspace_missing")
     persisted = persist_recovered_workspace_binding(
         s,
         workspace,
         expected_workspace=stored_workspace,
+        recovered_from=stored_workspace,
     )
     return str(persisted.workspace)
 
@@ -26777,15 +26915,34 @@ def _handle_chat_sync(handler, body):
     msg = str(body.get("message", "")).strip()
     if not msg:
         return j(handler, {"error": "empty message"}, status=400)
+    requested_workspace = body.get("workspace") or s.workspace
     try:
         try:
-            workspace = str(resolve_trusted_workspace(body.get("workspace") or s.workspace, profile=getattr(s, "profile", None)))
+            workspace = str(resolve_trusted_workspace(requested_workspace, profile=getattr(s, "profile", None)))
         except TypeError:
-            workspace = str(resolve_trusted_workspace(body.get("workspace") or s.workspace))
+            workspace = str(resolve_trusted_workspace(requested_workspace))
     except ValueError as e:
-        return bad(handler, str(e))
+        if str(requested_workspace) != str(getattr(s, "workspace", None)):
+            return bad(handler, str(e))
+        # A bound path that failed validation may have been deleted. Only the
+        # recovery helper can classify that without mistaking remote paths or
+        # inaccessible local folders for deletion.
+        try:
+            workspace = _resolve_chat_workspace_with_recovery(s, body.get("workspace"))
+        except WorkspaceBindingPersistenceError as recovery_error:
+            return bad(handler, str(recovery_error), 500)
+        except ValueError as recovery_error:
+            if str(recovery_error) == "workspace_missing":
+                return j(handler, {"error": "Session workspace folder no longer exists", "code": "workspace_missing"}, status=400)
+            return bad(handler, str(recovery_error))
     with _get_session_agent_lock(s.session_id):
-        s.workspace = workspace
+        if workspace != s.workspace and (
+            getattr(s, "messages", None) or getattr(s, "context_messages", None)
+            or getattr(s, "pending_user_message", None)
+        ):
+            return j(handler, {"error": "Workspace is immutable after the first message",
+                               "code": "workspace_immutable"}, status=400)
+        _bind_empty_session_workspace(s, workspace)
         _sync_requested_provider = (
             body.get("model_provider") if "model_provider" in body else getattr(s, "model_provider", None)
         )
@@ -28281,17 +28438,109 @@ def _handle_workspace_add(handler, body):
     except ValueError as e:
         return bad(handler, str(e))
     try:
-        wss = load_workspaces(profile=active_profile)
-    except TypeError:
-        wss = load_workspaces()
+        try:
+            wss = load_workspaces(profile=active_profile)
+        except TypeError:
+            wss = load_workspaces()
+    except (OSError, ValueError) as exc:
+        return bad(handler, f"Could not load workspaces: {_sanitize_error(exc)}", 500)
     if any(w["path"] == str(p) for w in wss):
         return bad(handler, "Workspace already in list")
-    wss.append({"path": str(p), "name": name or p.name})
-    try:
-        save_workspaces(wss, profile=active_profile)
-    except TypeError:
-        save_workspaces(wss)
-    return j(handler, {"ok": True, "workspaces": wss})
+    if not isinstance(body.get("link_project", True), bool):
+        return bad(handler, "link_project must be a boolean")
+    project_name = body.get("project_name") or name or p.name
+    if not isinstance(project_name, str) or not project_name.strip() or len(project_name.strip()) > 128:
+        return bad(handler, "Invalid project name")
+    color = body.get("color")
+    if color and (not isinstance(color, str) or not re.fullmatch(r"#[0-9a-fA-F]{3,8}", color)):
+        return bad(handler, "Invalid color format")
+    workspace_row = {"path": str(p), "name": name or p.name,
+                     "workspace_id": uuid.uuid4().hex[:12], "project_id": None}
+    project = None
+    with WORKSPACE_PROJECT_LOCK:
+        # Reload at the write edge to avoid linking a duplicate path from a
+        # concurrent request in this process.
+        try:
+            wss = load_workspaces(profile=active_profile)
+        except (OSError, ValueError) as exc:
+            return bad(handler, f"Could not load workspaces: {_sanitize_error(exc)}", 500)
+        if any(w.get("path") == str(p) for w in wss):
+            return bad(handler, "Workspace already in list")
+        if body.get("link_project", True):
+            try:
+                project = create_project_record(
+                    project_name.strip(), color, active_profile,
+                    load_fn=load_projects, save_fn=save_projects,
+                )
+            except Exception as exc:
+                return bad(handler, f"Could not create project: {_sanitize_error(exc)}", 500)
+            workspace_row["project_id"] = project["project_id"]
+        wss.append(workspace_row)
+        try:
+            save_workspaces(wss, profile=active_profile)
+        except Exception as exc:
+            if project:
+                try:
+                    # Remove only our new project from a fresh snapshot.
+                    save_projects([row for row in load_projects()
+                                   if row.get("project_id") != project["project_id"]])
+                except Exception:
+                    logger.exception("Could not roll back workspace project %s", project["project_id"])
+            return bad(handler, f"Could not save workspace: {_sanitize_error(exc)}", 500)
+    return j(handler, {"ok": True, "workspaces": wss, "workspace": workspace_row,
+                       "project": project})
+
+
+def _handle_workspace_link_project(handler, body):
+    active_profile = get_active_profile_name()
+    workspace_id = body.get("workspace_id")
+    if not isinstance(workspace_id, str) or not workspace_id:
+        return bad(handler, "workspace_id is required")
+    has_id = bool(body.get("project_id"))
+    has_name = bool(body.get("project_name"))
+    if has_id == has_name:
+        return bad(handler, "Supply project_id or project_name")
+    with WORKSPACE_PROJECT_LOCK:
+        try:
+            workspaces = load_workspaces(profile=active_profile)
+        except (OSError, ValueError) as exc:
+            return bad(handler, f"Could not load workspaces: {_sanitize_error(exc)}", 500)
+        row = next((w for w in workspaces if w.get("workspace_id") == workspace_id), None)
+        if row is None:
+            return j(handler, {"error": "Workspace not found", "code": "workspace_not_found"}, status=404)
+        from api.workspace import _profile_default_workspace
+        if row.get("path") == _profile_default_workspace(profile=active_profile):
+            return j(handler, {"error": "Default workspace cannot be linked", "code": "not_linkable"}, status=400)
+        if row.get("project_id"):
+            return j(handler, {"error": "Workspace already linked", "code": "workspace_already_linked"}, status=409)
+        projects = load_projects()
+        created = False
+        if has_id:
+            project = next((p for p in projects if p.get("project_id") == body["project_id"]), None)
+            if project is None or not _profiles_match(project.get("profile"), active_profile):
+                return bad(handler, "Project not found", 404)
+            if any(w.get("project_id") == project["project_id"] for w in workspaces):
+                return j(handler, {"error": "Project already linked", "code": "project_already_linked"}, status=409)
+        else:
+            name = body["project_name"]
+            if not isinstance(name, str) or not name.strip() or len(name.strip()) > 128:
+                return bad(handler, "Invalid project name")
+            project = create_project_record(
+                name.strip(), None, active_profile,
+                load_fn=load_projects, save_fn=save_projects,
+            )
+            created = True
+        row["project_id"] = project["project_id"]
+        try:
+            save_workspaces(workspaces, profile=active_profile)
+        except Exception as exc:
+            if created:
+                try:
+                    save_projects([p for p in load_projects() if p.get("project_id") != project["project_id"]])
+                except Exception:
+                    logger.exception("Could not roll back linked project %s", project["project_id"])
+            return bad(handler, f"Could not link project: {_sanitize_error(exc)}", 500)
+    return j(handler, {"ok": True, "workspace": row, "project": project})
 
 
 def _handle_workspace_remove(handler, body):
@@ -28300,16 +28549,29 @@ def _handle_workspace_remove(handler, body):
         return bad(handler, "path is required")
     from api.profiles import get_active_profile_name
     active_profile = get_active_profile_name()
-    try:
-        wss = load_workspaces(profile=active_profile)
-    except TypeError:
-        wss = load_workspaces()
-    wss = [w for w in wss if w["path"] != path_str]
-    try:
-        save_workspaces(wss, profile=active_profile)
-    except TypeError:
-        save_workspaces(wss)
-    return j(handler, {"ok": True, "workspaces": wss})
+    with WORKSPACE_PROJECT_LOCK:
+        try:
+            try:
+                wss = load_workspaces(profile=active_profile)
+            except TypeError:
+                wss = load_workspaces()
+            removed = next((w for w in wss if w.get("path") == path_str), None)
+            if removed is not None:
+                wss = [w for w in wss if w.get("path") != path_str]
+                try:
+                    save_workspaces(wss, profile=active_profile)
+                except TypeError:
+                    save_workspaces(wss)
+        except (OSError, ValueError) as exc:
+            error = exc
+        else:
+            error = None
+    if error is not None:
+        return bad(handler, f"Could not update workspaces: {_sanitize_error(error)}", 500)
+    if removed is None:
+        return bad(handler, "Workspace not found", 404)
+    return j(handler, {"ok": True, "workspaces": wss,
+                       "kept_project_id": removed.get("project_id")})
 
 
 def _handle_workspace_rename(handler, body):
@@ -28319,20 +28581,31 @@ def _handle_workspace_rename(handler, body):
         return bad(handler, "path and name are required")
     from api.profiles import get_active_profile_name
     active_profile = get_active_profile_name()
-    try:
-        wss = load_workspaces(profile=active_profile)
-    except TypeError:
-        wss = load_workspaces()
-    for w in wss:
-        if w["path"] == path_str:
-            w["name"] = name
-            break
-    else:
+    with WORKSPACE_PROJECT_LOCK:
+        try:
+            try:
+                wss = load_workspaces(profile=active_profile)
+            except TypeError:
+                wss = load_workspaces()
+            found = False
+            for w in wss:
+                if w["path"] == path_str:
+                    w["name"] = name
+                    found = True
+                    break
+            if found:
+                try:
+                    save_workspaces(wss, profile=active_profile)
+                except TypeError:
+                    save_workspaces(wss)
+        except (OSError, ValueError) as exc:
+            error = exc
+        else:
+            error = None
+    if error is not None:
+        return bad(handler, f"Could not update workspaces: {_sanitize_error(error)}", 500)
+    if not found:
         return bad(handler, "Workspace not found", 404)
-    try:
-        save_workspaces(wss, profile=active_profile)
-    except TypeError:
-        save_workspaces(wss)
     return j(handler, {"ok": True, "workspaces": wss})
 
 
@@ -28348,28 +28621,36 @@ def _handle_workspace_reorder(handler, body):
         return bad(handler, "paths is required and must be a list")
     from api.profiles import get_active_profile_name
     active_profile = get_active_profile_name()
-    try:
-        wss = load_workspaces(profile=active_profile)
-    except TypeError:
-        wss = load_workspaces()
-    by_path = {w["path"]: w for w in wss}
-    # Build reordered list: given order first, then any omitted entries
-    reordered = []
-    seen = set()
-    for p in paths:
-        p = p.strip()
-        if p in by_path and p not in seen:
-            reordered.append(by_path[p])
-            seen.add(p)
-    # Append any workspaces not mentioned (safety net)
-    for w in wss:
-        if w["path"] not in seen:
-            reordered.append(w)
-    try:
-        save_workspaces(reordered, profile=active_profile)
-    except TypeError:
-        # Legacy signature (test doubles with single-arg lambdas, older forks).
-        save_workspaces(reordered)
+    with WORKSPACE_PROJECT_LOCK:
+        try:
+            try:
+                wss = load_workspaces(profile=active_profile)
+            except TypeError:
+                wss = load_workspaces()
+            by_path = {w["path"]: w for w in wss}
+            # Build reordered list: given order first, then any omitted entries
+            reordered = []
+            seen = set()
+            for p in paths:
+                p = p.strip()
+                if p in by_path and p not in seen:
+                    reordered.append(by_path[p])
+                    seen.add(p)
+            # Append any workspaces not mentioned (safety net)
+            for w in wss:
+                if w["path"] not in seen:
+                    reordered.append(w)
+            try:
+                save_workspaces(reordered, profile=active_profile)
+            except TypeError:
+                # Legacy signature (test doubles with single-arg lambdas, older forks).
+                save_workspaces(reordered)
+        except (OSError, ValueError) as exc:
+            error = exc
+        else:
+            error = None
+    if error is not None:
+        return bad(handler, f"Could not update workspaces: {_sanitize_error(error)}", 500)
     return j(handler, {"ok": True, "workspaces": reordered})
 
 

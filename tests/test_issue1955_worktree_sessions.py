@@ -209,6 +209,9 @@ def test_session_new_worktree_fallback_workspace_is_resolved(tmp_path, monkeypat
         },
     )
     monkeypatch.setattr(routes, "get_last_workspace", lambda: str(repo))
+    # 2026-10-07T033205173150Z-pr-1-workspace-as-master-immutable-session-workspace-reviewed-im-755eb4.md line 16: absent workspace uses the configured profile default.
+    from api import workspace as workspace_api
+    monkeypatch.setattr(workspace_api, "_profile_default_workspace", lambda profile=None: str(repo))
 
     def fake_resolve(raw):
         seen["resolved"].append(raw)
@@ -237,6 +240,7 @@ def test_session_new_worktree_fallback_workspace_is_resolved(tmp_path, monkeypat
 
     assert routes.handle_post(object(), SimpleNamespace(path="/api/session/new")) is True
 
+    # 2026-10-07T033205173150Z-pr-1-workspace-as-master-immutable-session-workspace-reviewed-im-755eb4.md line 16: the configured path is resolved before worktree creation.
     assert seen["resolved"] == [str(repo)]
     assert captured["status"] == 200
     session = captured["payload"]["session"]

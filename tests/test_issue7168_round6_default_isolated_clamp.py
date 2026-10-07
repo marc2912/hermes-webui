@@ -146,8 +146,7 @@ class TestRound6DefaultHonorsIsolationClamp:
         )
 
     def test_new_session_binds_global_state_workspace(self, isolated_default_pinned, monkeypatch):
-        """Session creation with profile='default' honors the global state
-        authority and never leaks onto the base home (round-7 contract)."""
+        """Configured default remains isolated from poisoned global/base last paths."""
         import api.models as models
 
         env = isolated_default_pinned
@@ -170,9 +169,9 @@ class TestRound6DefaultHonorsIsolationClamp:
 
         s = models.new_session(profile="default")
         assert s.profile == "default"
-        assert str(s.workspace) == str(bound_ws.resolve()), (
-            f"new_session(profile='default') in isolated mode must bind the "
-            f"GLOBAL state authority's workspace, got {s.workspace!r}"
+        # 2026-10-07T033205173150Z-pr-1-workspace-as-master-immutable-session-workspace-reviewed-im-755eb4.md line 16: omitted workspace binds the configured profile default.
+        assert str(s.workspace) == str(workspace._profile_default_workspace(profile="default")), (
+            f"new_session(profile='default') must bind its configured default, got {s.workspace!r}"
         )
         assert str(s.workspace) != str(poisoned_ws.resolve()), (
             "must never leak onto the BASE home's webui_state binding"
@@ -273,7 +272,8 @@ class TestRound7DefaultStateRouting:
         )
 
         # Explicit profile="default" reads the pre-upgrade list...
-        assert workspace.load_workspaces(profile="default") == pre
+        # 2026-10-07T033205173150Z-pr-1-workspace-as-master-immutable-session-workspace-reviewed-im-755eb4.md line 18: lazy migration adds workspace_id and project_id.
+        assert [{"path": w["path"], "name": w["name"]} for w in workspace.load_workspaces(profile="default")] == pre
 
         # ...and explicit writes land in the SAME global file.
         added = env["tmp"] / "srv" / "added"
@@ -284,7 +284,8 @@ class TestRound7DefaultStateRouting:
 
         # Ambient calls see the identical authority — no split.
         assert workspace._profile_state_dir(None) == g
-        assert workspace.load_workspaces() == updated
+        # 2026-10-07T033205173150Z-pr-1-workspace-as-master-immutable-session-workspace-reviewed-im-755eb4.md line 18: compare legacy fields while allowing migrated schema keys.
+        assert [{"path": w["path"], "name": w["name"]} for w in workspace.load_workspaces()] == updated
 
         # No divergent webui_state authority may appear under the pinned home.
         assert not (env["pinned"] / "webui_state" / "workspaces.json").exists()

@@ -171,9 +171,12 @@ def test_remote_terminal_linux_home_preserves_path_without_macos_synthetic_resol
     assert workspace.resolve_trusted_workspace("/home/developer") == Path("/home/developer")
     assert workspace.get_profile_default_workspace() == "/home/developer"
     assert workspace._resolve_path("/home/developer") == Path("/home/developer")
-    assert workspace._clean_workspace_list([{"path": "/home/developer", "name": "Dev"}]) == [
-        {"path": "/home/developer", "name": "Dev"}
+    # 2026-10-07T033205173150Z-pr-1-workspace-as-master-immutable-session-workspace-reviewed-im-755eb4.md line 18: each workspace record gains a durable ID and nullable project link.
+    cleaned = workspace._clean_workspace_list([{"path": "/home/developer", "name": "Dev"}])
+    assert [(row["path"], row["name"], row["project_id"]) for row in cleaned] == [
+        ("/home/developer", "Dev", None)
     ]
+    assert cleaned[0]["workspace_id"]
 
 
 def test_session_init_and_created_workspace_preserve_remote_posix_path(monkeypatch):
@@ -1011,12 +1014,10 @@ def test_get_last_workspace_named_profile_never_reads_global_file(monkeypatch, t
 
 
 def test_new_session_binds_explicit_profile_not_ambient_last_workspace(monkeypatch, tmp_path):
-    """new_session()/import_cli_session() must scope their fallback getter.
+    """API session defaults and CLI import fallback remain profile-scoped.
 
-    Maintainer re-gate round 3 (CORE): both Session constructions fell back to
-    get_last_workspace() WITHOUT the profile even though profile=profile was
-    set on the same Session — an Alice session created under ambient Bob bound
-    to BOB's workspace. Uses the real getters and real state files.
+    # 2026-10-07T033205173150Z-pr-1-workspace-as-master-immutable-session-workspace-reviewed-im-755eb4.md line 16: new_session uses Alice's configured workspace;
+    # import_cli_session retains Alice's last-workspace fallback.
     """
     import api.models as models
     from api import profiles
@@ -1050,10 +1051,12 @@ def test_new_session_binds_explicit_profile_not_ambient_last_workspace(monkeypat
 
     monkeypatch.setattr(workspace, "_last_workspace_file_for_profile", _lw_file_for)
     monkeypatch.setattr(models, "get_last_workspace", workspace.get_last_workspace)
+    monkeypatch.setattr(models, "_profile_default_workspace", lambda profile=None: str(alice_ws) if profile == "alice" else str(bobs_ws))
 
     s = models.new_session(profile="alice")
+    # 2026-10-07T033205173150Z-pr-1-workspace-as-master-immutable-session-workspace-reviewed-im-755eb4.md line 16: omitted API workspace uses the configured profile default.
     assert str(s.workspace) == str(alice_ws), (
-        "new_session under profile='alice' must bind ALICE's last workspace, "
+        "new_session under profile='alice' must bind ALICE's configured workspace, "
         f"got {s.workspace!r}"
     )
 

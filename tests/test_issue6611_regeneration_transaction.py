@@ -340,7 +340,8 @@ def test_regeneration_lock_winner_blocks_a_later_normal_send(monkeypatch):
         session,
         msg="ignored",
         attachments=[],
-        workspace="C:/workspace",
+        # 2026-10-07T033205173150Z-pr-1-workspace-as-master-immutable-session-workspace-reviewed-im-755eb4.md line 34 item 5: a messageful session keeps its bound workspace.
+        workspace=session.workspace,
         model="model",
         model_provider="provider",
         external_runtime_owned=False,

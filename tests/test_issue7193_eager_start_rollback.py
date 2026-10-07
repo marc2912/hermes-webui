@@ -55,6 +55,8 @@ def _start(session, *, workspace, **overrides):
         "external_runtime_owned": False,
     }
     values.update(overrides)
+    # 2026-10-07T033205173150Z-pr-1-workspace-as-master-immutable-session-workspace-reviewed-im-755eb4.md line 16:
+    # callers select the bound path after first message; preserve their request.
     return routes._start_chat_stream_for_session(session, **values)
 
 
@@ -95,13 +97,13 @@ def test_eager_rejected_before_stream_registration_retry_reload_has_one_new_prom
     )
 
     with pytest.raises(RuntimeError, match="stream registration rejected"):
-        _start(session, workspace=issue7193_env / "workspace")
+        _start(session, workspace=session.workspace)
 
     rejected = Session.load(session.session_id)
     assert [row["content"] for row in _user_rows(rejected)] == ["retry me"]
 
     monkeypatch.setattr(routes, "create_stream_channel", real_create_stream_channel)
-    _start(session, workspace=issue7193_env / "workspace")
+    _start(session, workspace=session.workspace)
 
     reloaded = Session.load(session.session_id)
     assert [row["content"] for row in _user_rows(reloaded)] == [
@@ -200,7 +202,7 @@ def test_rejected_start_waits_for_concurrent_draft_writer_until_cleanup(
 
     def start_chat():
         try:
-            _start(session, workspace=issue7193_env / "workspace")
+            _start(session, workspace=session.workspace)
         except RuntimeError as exc:
             admission_error.append(exc)
 
@@ -254,7 +256,7 @@ def test_rejected_start_waits_for_same_value_metadata_writer_until_cleanup(
         try:
             _start(
                 session,
-                workspace=issue7193_env / "workspace",
+                workspace=session.workspace,
                 model="prepared-model",
                 model_provider="prepared-provider",
             )
@@ -315,7 +317,7 @@ def test_rejected_start_preserves_entry_recovery_backup_bytes(
         lambda: (_ for _ in ()).throw(RuntimeError("stream registration rejected")),
     )
     with pytest.raises(RuntimeError, match="stream registration rejected"):
-        _start(session, workspace=issue7193_env / "workspace")
+        _start(session, workspace=session.workspace)
 
     assert backup_path.read_bytes() == entry_backup
     status = inspect_session_recovery_status(session.path)
@@ -339,7 +341,7 @@ def test_accepted_start_allows_unreadable_entry_backup_and_preserves_bytes(
 
     monkeypatch.setattr(routes.Path, "read_bytes", fail_entry_backup_read)
 
-    response = _start(session, workspace=issue7193_env / "workspace")
+    response = _start(session, workspace=session.workspace)
 
     assert response["session_id"] == session.session_id
     assert response["stream_id"] == session.active_stream_id
@@ -364,7 +366,7 @@ def test_accepted_start_allows_unreadable_entry_sidecar(
 
     response = _start(
         session,
-        workspace=issue7193_env / "workspace",
+        workspace=session.workspace,
         msg="new unreadable sidecar prompt",
     )
 
@@ -399,7 +401,7 @@ def test_rejected_start_with_unreadable_entry_backup_restores_session_and_backup
     with pytest.raises(RuntimeError, match="stream registration rejected"):
         _start(
             session,
-            workspace=issue7193_env / "workspace",
+            workspace=session.workspace,
             msg="new unreadable backup prompt",
         )
 
@@ -433,7 +435,7 @@ def test_rejected_eager_start_keeps_existing_recovery_contract(
     )
 
     with pytest.raises(RuntimeError, match="stream registration rejected"):
-        _start(session, workspace=issue7193_env / "workspace")
+        _start(session, workspace=session.workspace if existing_session else issue7193_env / "workspace")
 
     live = Session.load(session.session_id)
     assert [row["content"] for row in _user_rows(live)] == (
@@ -469,7 +471,7 @@ def test_save_replaces_sidecar_then_raises_restores_snapshot(issue7193_env, monk
     monkeypatch.setattr(models, "_write_session_index", fail_once)
 
     with pytest.raises(OSError, match="index publication failed"):
-        _start(session, workspace=issue7193_env / "workspace")
+        _start(session, workspace=session.workspace)
 
     state = copy.deepcopy(session.__dict__)
     assert state == before
@@ -508,7 +510,7 @@ def test_eager_thread_start_failure_retry_reload_has_one_new_prompt(issue7193_en
 
     monkeypatch.setattr(threading.Thread, "start", reject_start)
     with pytest.raises(RuntimeError, match="thread launch rejected"):
-        _start(session, workspace=issue7193_env / "workspace")
+        _start(session, workspace=session.workspace)
 
     rejected = Session.load(session.session_id)
     assert [row["content"] for row in _user_rows(rejected)] == ["retry me"]
@@ -517,7 +519,7 @@ def test_eager_thread_start_failure_retry_reload_has_one_new_prompt(issue7193_en
     assert not config.STREAMS
 
     monkeypatch.setattr(threading.Thread, "start", original_start)
-    _start(session, workspace=issue7193_env / "workspace")
+    _start(session, workspace=session.workspace)
 
     reloaded = Session.load(session.session_id)
     assert [row["content"] for row in _user_rows(reloaded)] == ["retry me", "retry me"]
@@ -545,6 +547,11 @@ def test_rejected_start_restores_snapshot_field(issue7193_env, monkeypatch, fiel
     session = _saved_retry_session(issue7193_env)
     if field == "workspace":
         value = str(issue7193_env.parent / "original-workspace")
+        # 2026-10-07T033205173150Z-pr-1-workspace-as-master-immutable-session-workspace-reviewed-im-755eb4.md line 16: an empty session may bind a different workspace;
+        # this case still proves first-turn binding rolls back after rejection.
+        session.messages = []
+        session.context_messages = []
+        session.pending_user_message = None
     setattr(session, field, copy.deepcopy(value))
     session.save(touch_updated_at=False)
     before = copy.deepcopy(session.__dict__)
@@ -555,7 +562,7 @@ def test_rejected_start_restores_snapshot_field(issue7193_env, monkeypatch, fiel
     )
 
     with pytest.raises(RuntimeError, match="stream registration rejected"):
-        _start(session, workspace=issue7193_env / "new-workspace")
+        _start(session, workspace=issue7193_env / "new-workspace" if field == "workspace" else session.workspace)
 
     assert getattr(session, field) == before[field]
     reloaded = Session.load(session.session_id)
@@ -599,7 +606,7 @@ def test_rollback_save_failure_preserves_original_initialization_error(issue7193
     )
 
     with pytest.raises(RuntimeError, match="stream registration rejected"):
-        _start(session, workspace=issue7193_env / "new-workspace")
+        _start(session, workspace=session.workspace)
 
     assert len(save_calls) == 2
     assert save_calls[1].get("touch_updated_at") is False
@@ -703,7 +710,7 @@ def test_unknown_backup_sidecar_restore_failure_skips_save_and_preserves_error(
     )
 
     with pytest.raises(RuntimeError, match="stream registration rejected"):
-        _start(session, workspace=issue7193_env / "workspace")
+        _start(session, workspace=session.workspace)
 
     assert session.__dict__ == before
     assert len(save_calls) == 1

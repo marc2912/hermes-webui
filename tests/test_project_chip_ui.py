@@ -245,8 +245,11 @@ class TestQuickCreateMobileDrawer:
     def _quick_create_block(self):
         idx = SESSIONS_JS.find("function _attachProjectQuickCreateButton(")
         assert idx != -1, "project quick-create helper not found in sessions.js"
-        # Function body incl. the full onclick success path (~3K covers it).
-        return SESSIONS_JS[idx: idx + 3000]
+        # 2026-10-07T033205173150Z-pr-1-workspace-as-master-immutable-session-workspace-reviewed-im-755eb4.md line 34 item 3: project chip handling now includes workspace logic;
+        # keep the same success-path assertions over the full handler.
+        end = SESSIONS_JS.find("\n}\n\n", idx)
+        assert end != -1
+        return SESSIONS_JS[idx: end + 2]
 
     def test_quick_create_success_path_closes_mobile_drawer(self):
         block = self._quick_create_block()
@@ -276,4 +279,3 @@ class TestQuickCreateMobileDrawer:
             "closeMobileSidebar must stay in the success path (try block) — moving it "
             "into the catch branch would keep the drawer open over the error toast"
         )
-

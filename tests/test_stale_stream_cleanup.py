@@ -104,7 +104,8 @@ def test_chat_start_rechecks_active_stream_under_session_lock(monkeypatch, tmp_p
             self.messages = []
             self.title = "Untitled"
             self.worktree_path = None
-            self.workspace = None
+            # 2026-10-07T033205173150Z-pr-1-workspace-as-master-immutable-session-workspace-reviewed-im-755eb4.md line 16: the later send uses this session's bound path.
+            self.workspace = str(tmp_path)
             self.model = None
             self.model_provider = None
 

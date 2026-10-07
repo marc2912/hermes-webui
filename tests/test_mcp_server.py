@@ -114,6 +114,10 @@ def _cleanup_state_dir(state_dir: Path):
             models_mod = sys.modules["api.models"]
             for attr, val in saved["api.models"].items():
                 setattr(models_mod, attr, val)
+        if "api.workspace" in sys.modules:
+            workspace_mod = sys.modules["api.workspace"]
+            for attr, val in saved["api.workspace"].items():
+                setattr(workspace_mod, attr, val)
         # Restore HERMES_BASE_HOME / HERMES_HOME if we changed them
         for env_key, env_val in saved["env"].items():
             if env_val is _MISSING_ENV:
@@ -195,6 +199,13 @@ def _reimport_mcp():
             }
         else:
             _SAVED_CONSTANTS["api.models"] = {}
+        # Operator decision (MCP delete fix): deletion now writes the owning
+        # workspace list, so its imported path must share this isolated state.
+        import api.workspace as workspace_mod
+        _SAVED_CONSTANTS["api.workspace"] = {
+            "_GLOBAL_WS_FILE": workspace_mod._GLOBAL_WS_FILE,
+            "_GLOBAL_LW_FILE": workspace_mod._GLOBAL_LW_FILE,
+        }
         _SAVED_CONSTANTS["captured"] = True
 
     # Acquire the api.profiles module THAT mcp_server's bound functions read.
@@ -259,6 +270,9 @@ def _reimport_mcp():
             models_mod.PROJECTS_FILE = cfg.PROJECTS_FILE
         if hasattr(models_mod, 'SESSION_DIR'):
             models_mod.SESSION_DIR = cfg.SESSION_DIR
+    import api.workspace as workspace_mod
+    workspace_mod._GLOBAL_WS_FILE = cfg.WORKSPACES_FILE
+    workspace_mod._GLOBAL_LW_FILE = cfg.LAST_WORKSPACE_FILE
 
     # Re-evaluate WEBUI_URL from current env (PR #1895 made it env-aware
     # but the value is computed once at module load; tests need to see
@@ -387,6 +401,137 @@ class TestDeleteProject:
         self.mod, self.profiles = _reimport_mcp()
         yield
         _cleanup_state_dir(self.state_dir)
+
+    async def _seed_linked_tree(self):
+        from api.config import PROJECTS_FILE, WORKSPACES_FILE
+
+        parent = await _call(self.mod, "create_project", name="Parent")
+        deleted = await _call(self.mod, "create_project", name="ToDelete")
+        child = await _call(self.mod, "create_project", name="Child")
+        projects = json.loads(PROJECTS_FILE.read_text(encoding="utf-8"))
+        for row in projects:
+            if row["project_id"] in (deleted["project_id"], child["project_id"]):
+                row["parent_id"] = (
+                    parent["project_id"] if row["project_id"] == deleted["project_id"]
+                    else deleted["project_id"]
+                )
+        PROJECTS_FILE.write_text(json.dumps(projects), encoding="utf-8")
+        home = self.state_dir / "home"
+        repo = self.state_dir / "repo"
+        home.mkdir()
+        repo.mkdir()
+        WORKSPACES_FILE.write_text(json.dumps([
+            {"path": str(home), "name": "Home", "workspace_id": "home", "project_id": None},
+            {"path": str(repo), "name": "Repo", "workspace_id": "repo", "project_id": deleted["project_id"]},
+        ]), encoding="utf-8")
+        return parent, deleted, child
+
+    async def test_delete_unlinks_reparents_and_uses_authenticated_move(self, monkeypatch):
+        """Operator decision (MCP delete fix): API moves own session writes."""
+        from api.config import PROJECTS_FILE, WORKSPACES_FILE, SESSION_DIR, SESSION_INDEX_FILE
+
+        parent, deleted, child = await self._seed_linked_tree()
+        sid = "mcp-linked-session"
+        session_path = SESSION_DIR / f"{sid}.json"
+        messages = [{"role": "user", "content": "keep history"}]
+        session_path.write_text(json.dumps({
+            "session_id": sid, "project_id": deleted["project_id"],
+            "project_source": "explicit", "messages": messages,
+        }), encoding="utf-8")
+        SESSION_INDEX_FILE.write_text(json.dumps([
+            {"session_id": sid, "project_id": deleted["project_id"]}
+        ]), encoding="utf-8")
+        calls = []
+
+        def api_move(endpoint, body):
+            calls.append((endpoint, dict(body)))
+            saved = json.loads(session_path.read_text(encoding="utf-8"))
+            saved["project_id"] = None
+            saved["project_source"] = None
+            session_path.write_text(json.dumps(saved), encoding="utf-8")
+            return {"ok": True}
+
+        monkeypatch.setattr(self.mod, "_api_password", lambda: "isolated-test-auth")
+        monkeypatch.setattr(self.mod, "_api_post", api_move)
+        result = await _call(self.mod, "delete_project", project_id=deleted["project_id"])
+
+        assert result["unlinked_workspace_ids"] == ["repo"]
+        assert result["reparented_project_ids"] == [child["project_id"]]
+        assert result["unassigned_sessions"] == 1
+        assert calls == [("/api/session/move", {"session_id": sid, "project_id": None})]
+        rows = json.loads(WORKSPACES_FILE.read_text(encoding="utf-8"))
+        assert next(row for row in rows if row["workspace_id"] == "repo")["project_id"] is None
+        projects = json.loads(PROJECTS_FILE.read_text(encoding="utf-8"))
+        assert next(row for row in projects if row["project_id"] == child["project_id"])["parent_id"] == parent["project_id"]
+        assert not any(row["project_id"] == deleted["project_id"] for row in projects)
+        saved = json.loads(session_path.read_text(encoding="utf-8"))
+        assert (saved["project_id"], saved["project_source"], saved["messages"]) == (None, None, messages)
+
+    async def test_delete_without_auth_still_unlinks_and_reparents(self, monkeypatch):
+        """Operator decision (MCP delete fix): no auth leaves sidecars untouched."""
+        from api.config import PROJECTS_FILE, WORKSPACES_FILE, SESSION_DIR
+
+        parent, deleted, child = await self._seed_linked_tree()
+        sid = "mcp-no-auth-linked"
+        session_path = SESSION_DIR / f"{sid}.json"
+        session_path.write_text(json.dumps({
+            "session_id": sid, "project_id": deleted["project_id"],
+            "project_source": "derived", "messages": [{"role": "user", "content": "kept"}],
+        }), encoding="utf-8")
+        before = session_path.read_bytes()
+        monkeypatch.setattr(self.mod, "_api_password", lambda: None)
+        monkeypatch.setattr(self.mod, "_api_post", lambda *_a, **_kw: pytest.fail("no-auth path called API"))
+
+        result = await _call(self.mod, "delete_project", project_id=deleted["project_id"])
+
+        assert result["unassigned_sessions"] == 0
+        assert result["warning"] == (
+            "Set HERMES_WEBUI_PASSWORD to unassign sessions; "
+            "without auth the session index cannot be safely "
+            "updated and direct filesystem writes would cause "
+            "index drift in a running WebUI."
+        )
+        assert result["unlinked_workspace_ids"] == ["repo"]
+        assert result["reparented_project_ids"] == [child["project_id"]]
+        assert next(row for row in json.loads(WORKSPACES_FILE.read_text()) if row["workspace_id"] == "repo")["project_id"] is None
+        remaining = json.loads(PROJECTS_FILE.read_text())
+        assert next(row for row in remaining if row["project_id"] == child["project_id"])["parent_id"] == parent["project_id"]
+        assert not any(row["project_id"] == deleted["project_id"] for row in remaining)
+        assert session_path.read_bytes() == before
+
+    async def test_http_and_mcp_delete_share_file_result(self, monkeypatch):
+        """Operator decision (MCP delete fix): both entry points use one mutation."""
+        from api import routes
+        from api.config import PROJECTS_FILE, WORKSPACES_FILE, SESSION_INDEX_FILE
+        from unittest.mock import MagicMock
+        from urllib.parse import urlparse
+
+        _parent, deleted, _child = await self._seed_linked_tree()
+        original_projects = PROJECTS_FILE.read_bytes()
+        original_workspaces = WORKSPACES_FILE.read_bytes()
+        monkeypatch.setattr(routes, "SESSION_INDEX_FILE", SESSION_INDEX_FILE)
+        monkeypatch.setattr(routes, "get_active_profile_name", lambda: "default")
+        monkeypatch.setattr(routes, "read_body", lambda _handler: {"project_id": deleted["project_id"]})
+        monkeypatch.setattr(routes, "_check_csrf", lambda _handler: True)
+        monkeypatch.setattr(routes, "_guard_request_session_visibility", lambda *_a, **_kw: True)
+        monkeypatch.setattr(routes, "j", lambda _handler, payload, status=200: (payload, status))
+        monkeypatch.setattr(routes, "bad", lambda _handler, message, status=400: ({"error": message}, status))
+        handler = MagicMock()
+        handler.command = "POST"
+        handler.headers = {}
+        http, status = routes.handle_post(handler, urlparse("/api/projects/delete"))
+        assert status == 200
+        http_files = (json.loads(PROJECTS_FILE.read_text()), json.loads(WORKSPACES_FILE.read_text()))
+
+        PROJECTS_FILE.write_bytes(original_projects)
+        WORKSPACES_FILE.write_bytes(original_workspaces)
+        monkeypatch.setattr(self.mod, "_api_password", lambda: None)
+        mcp = await _call(self.mod, "delete_project", project_id=deleted["project_id"])
+        mcp_files = (json.loads(PROJECTS_FILE.read_text()), json.loads(WORKSPACES_FILE.read_text()))
+
+        assert http_files == mcp_files
+        assert http["unlinked_workspace_ids"] == mcp["unlinked_workspace_ids"] == ["repo"]
+        assert http["reparented_project_ids"] == mcp["reparented_project_ids"]
 
     async def test_delete_basic(self):
         created = await _call(self.mod, "create_project", name="ToDelete")

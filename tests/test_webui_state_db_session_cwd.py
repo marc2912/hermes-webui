@@ -331,7 +331,8 @@ def _run_stream(db, workspace, outcome, sid, *, current_session=None, during_tur
     resolves once ``during_turn`` ran (a detached-snapshot race); by default
     it is the worker's own session object."""
     stream_id = f"stream-{sid}"
-    session = Session(session_id=sid, title="t")
+    # 2026-10-07T033205173150Z-pr-1-workspace-as-master-immutable-session-workspace-reviewed-im-755eb4.md line 16: the worker launch path is the session's first binding.
+    session = Session(session_id=sid, title="t", workspace=str(workspace))
     session.messages, session.context_messages = [], []
     session.pending_user_message = "hi"
     session.pending_started_at = 1.0

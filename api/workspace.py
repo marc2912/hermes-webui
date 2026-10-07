@@ -23,10 +23,12 @@ import contextlib
 import contextvars
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
 logger = logging.getLogger(__name__)
+WORKSPACE_PROJECT_LOCK = threading.RLock()
 
 _ESCAPE_AUTH_TTL_SECONDS = 300
 _ESCAPE_AUTH_LOCK = threading.Lock()
@@ -467,7 +469,12 @@ def _clean_workspace_list(workspaces: list, profile: str | Path | None = None) -
     """
     hermes_profiles = (_home_path() / '.hermes' / 'profiles').resolve()
     result = []
+    seen_paths = set()
+    seen_ids = set()
+    seen_projects = set()
     for w in workspaces:
+        if not isinstance(w, dict):
+            continue
         path = w.get('path', '')
         name = w.get('name', '')
         if not path:
@@ -499,10 +506,26 @@ def _clean_workspace_list(workspaces: list, profile: str | Path | None = None) -
                 continue  # under profiles/ but not our own — cross-profile leak, skip
         except ValueError:
             pass  # not under profiles/ at all — keep it
+        if str(p) in seen_paths:
+            continue
+        seen_paths.add(str(p))
         # Rename confusing 'default' label to 'Home'
         if name.lower() == 'default':
             name = 'Home'
-        result.append({'path': str(p), 'name': name})
+        cleaned = dict(w)
+        cleaned.update(path=str(p), name=name)
+        wid = cleaned.get('workspace_id')
+        if not isinstance(wid, str) or not wid or wid in seen_ids:
+            wid = uuid.uuid4().hex[:12]
+        cleaned['workspace_id'] = wid
+        seen_ids.add(wid)
+        project_id = cleaned.get('project_id')
+        if project_id in seen_projects:
+            project_id = None
+        cleaned['project_id'] = project_id
+        if project_id is not None:
+            seen_projects.add(project_id)
+        result.append(cleaned)
     return result
 
 
@@ -548,34 +571,39 @@ def _migrate_global_workspaces() -> list:
         return []
     try:
         raw = json.loads(_GLOBAL_WS_FILE.read_text(encoding='utf-8'))
-        cleaned = _clean_workspace_list(raw)
-        if len(cleaned) != len(raw):
-            # Rewrite the cleaned version so future reads are already clean
-            _GLOBAL_WS_FILE.write_text(
-                json.dumps(cleaned, ensure_ascii=False, indent=2), encoding='utf-8'
-            )
-        return cleaned
-    except Exception:
+    except (OSError, json.JSONDecodeError):
         return []
+    cleaned = _clean_workspace_list(raw)
+    if cleaned != raw:
+        # A migration-generated ID must be durable before any caller sees it.
+        _GLOBAL_WS_FILE.write_text(
+            json.dumps(cleaned, ensure_ascii=False, indent=2), encoding='utf-8'
+        )
+    return cleaned
 
 
 def load_workspaces(profile: str | Path | None = None) -> list:
+    with WORKSPACE_PROJECT_LOCK:
+        return _load_workspaces_locked(profile)
+
+
+def _load_workspaces_locked(profile: str | Path | None = None) -> list:
     ws_file = _workspaces_file_for_profile(profile)
     if ws_file is not None and ws_file.exists():
         try:
             raw = json.loads(ws_file.read_text(encoding='utf-8'))
-            cleaned = _clean_workspace_list(raw, profile=profile)
-            if len(cleaned) != len(raw):
-                # Persist the cleaned version so stale entries don't keep reappearing
-                try:
-                    ws_file.write_text(
-                        json.dumps(cleaned, ensure_ascii=False, indent=2), encoding='utf-8'
-                    )
-                except Exception:
-                    logger.debug("Failed to persist cleaned workspace list")
-            return cleaned or [{'path': _profile_default_workspace(profile=profile), 'name': 'Home'}]
-        except Exception:
+        except (OSError, json.JSONDecodeError):
             logger.debug("Failed to load workspaces from %s", ws_file)
+        else:
+            cleaned = _clean_workspace_list(raw, profile=profile)
+            if cleaned != raw:
+                # A newly minted ID is usable only after it is durable.
+                save_workspaces(cleaned, profile=profile)
+            if cleaned:
+                return cleaned
+            default = _default_workspace_record(profile)
+            save_workspaces(default, profile=profile)
+            return default
     # No profile-local file yet.
     # For the DEFAULT profile: migrate from the legacy global file (one-time cleanup).
     # For NAMED profiles: always start clean with just their own workspace.
@@ -591,19 +619,29 @@ def load_workspaces(profile: str | Path | None = None) -> list:
     if is_default:
         migrated = _migrate_global_workspaces()
         if migrated:
+            save_workspaces(migrated, profile=profile)
             return migrated
     # Fresh start: single entry from the profile's configured workspace, labeled "Home"
-    return [{'path': _profile_default_workspace(profile=profile), 'name': 'Home'}]
+    default = _default_workspace_record(profile)
+    save_workspaces(default, profile=profile)
+    return default
+
+
+def _default_workspace_record(profile):
+    records = [{'path': _profile_default_workspace(profile=profile), 'name': 'Home'}]
+    cleaned = _clean_workspace_list(records, profile=profile)
+    return cleaned or [{**records[0], 'workspace_id': uuid.uuid4().hex[:12], 'project_id': None}]
 
 
 def save_workspaces(workspaces: list, profile: str | Path | None = None) -> None:
-    ws_file = _workspaces_file_for_profile(profile)
-    if ws_file is None:
-        # Fail-closed: an invalid profile name must not write any state file
-        # (it would land in the default profile's directory via the old clamp).
-        raise ValueError(f"cannot save workspaces for invalid profile {profile!r}")
-    ws_file.parent.mkdir(parents=True, exist_ok=True)
-    ws_file.write_text(json.dumps(workspaces, ensure_ascii=False, indent=2), encoding='utf-8')
+    with WORKSPACE_PROJECT_LOCK:
+        ws_file = _workspaces_file_for_profile(profile)
+        if ws_file is None:
+            # Fail-closed: an invalid profile name must not write any state file
+            # (it would land in the default profile's directory via the old clamp).
+            raise ValueError(f"cannot save workspaces for invalid profile {profile!r}")
+        ws_file.parent.mkdir(parents=True, exist_ok=True)
+        ws_file.write_text(json.dumps(workspaces, ensure_ascii=False, indent=2), encoding='utf-8')
 
 
 def get_profile_default_workspace(profile: str | Path | None = None) -> str:

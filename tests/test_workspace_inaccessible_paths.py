@@ -24,7 +24,12 @@ def test_load_workspaces_preserves_unavailable_entries_on_disk(tmp_path, monkeyp
     loaded = workspace.load_workspaces()
 
     assert [w["path"] for w in loaded] == [str(existing.resolve()), str(unavailable.resolve())]
-    assert json.loads(ws_file.read_text(encoding="utf-8")) == raw
+    # 2026-10-07T033205173150Z-pr-1-workspace-as-master-immutable-session-workspace-reviewed-im-755eb4.md line 18: missing paths stay while lazy migration persists IDs and null links.
+    persisted = json.loads(ws_file.read_text(encoding="utf-8"))
+    assert [(w["path"], w["name"], w["project_id"]) for w in persisted] == [
+        (w["path"], w["name"], None) for w in raw
+    ]
+    assert all(w["workspace_id"] for w in persisted)
 
 
 def test_clean_workspace_list_still_renames_default_without_dropping_missing(tmp_path):
@@ -34,7 +39,11 @@ def test_clean_workspace_list_still_renames_default_without_dropping_missing(tmp
         {"path": str(missing), "name": "default"},
     ])
 
-    assert cleaned == [{"path": str(missing.resolve()), "name": "Home"}]
+    # 2026-10-07T033205173150Z-pr-1-workspace-as-master-immutable-session-workspace-reviewed-im-755eb4.md line 18: cleaning retains the missing path and supplies schema keys.
+    assert [(w["path"], w["name"], w["project_id"]) for w in cleaned] == [
+        (str(missing.resolve()), "Home", None)
+    ]
+    assert cleaned[0]["workspace_id"]
 
 
 def test_validate_workspace_to_add_distinguishes_permission_denied(monkeypatch, tmp_path):
